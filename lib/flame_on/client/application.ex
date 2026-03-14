@@ -8,6 +8,7 @@ defmodule FlameOn.Client.Application do
         [
           {DynamicSupervisor, strategy: :one_for_one, name: GRPC.Client.Supervisor},
           {FlameOn.Client.Shipper, name: FlameOn.Client.Shipper},
+          {FlameOn.Client.TraceSessionSupervisor, name: FlameOn.Client.TraceSessionSupervisor},
           {FlameOn.Client.Collector, name: FlameOn.Client.Collector}
         ]
       else

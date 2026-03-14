@@ -5,14 +5,14 @@ Production profiling client for Elixir applications. Captures per-process call s
 ## How It Works
 
 1. **Telemetry events** fire in your application (Phoenix requests, Oban jobs, LiveView events, etc.)
-2. The **Collector** receives the event synchronously (via `GenServer.call`), rolls the dice against your sample rate, and starts `:erlang.trace/3` on the calling process — the caller blocks until tracing is active, ensuring the complete call chain is captured
-3. Trace messages (`:call`, `:return_to`, scheduling in/out) stream into the Collector, which builds a hierarchical call stack in real time
-4. When the traced process exits (or the corresponding `:stop` telemetry event fires), the stack is **finalized** into a block tree, then **collapsed** into root-to-leaf stack paths with durations
+2. The **Collector** receives the event synchronously (via `GenServer.call`), rolls the dice against your sample rate, and spawns a **TraceSession** process (via `DynamicSupervisor`) that calls `:erlang.trace/3` on the calling process — the caller blocks until tracing is active, ensuring the complete call chain is captured
+3. Trace messages (`:call`, `:return_to`, scheduling in/out) stream into the **TraceSession** (not the Collector), which builds a hierarchical call stack in real time. This keeps the Collector's mailbox clear so it stays responsive to new telemetry events under load.
+4. When the traced process exits (or the corresponding `:stop` telemetry event fires), the TraceSession **finalizes** the stack into a block tree, then **collapses** it into root-to-leaf stack paths with durations, and terminates
 5. **Threshold filtering** drops traces whose total duration is below the event's configured threshold — only slow traces get shipped
 6. The **ProfileFilter** removes the children of any block whose inclusive duration is below the `function_length_threshold` (default 1%) — the block itself is kept as a leaf with its full duration, but its sub-call detail is discarded to reduce noise and payload size
 7. The **Shipper** batches filtered stacks, encodes each trace as a [pprof](https://github.com/google/pprof/blob/main/proto/profile.proto) `Profile`, and ships them to FlameOn over gRPC
 
-The only synchronous overhead on the traced process is the initial trace setup (step 2). After that, trace messages flow asynchronously — no application code runs in the hot path.
+The only synchronous overhead on the traced process is the initial trace setup (step 2). After that, trace messages flow asynchronously to a dedicated per-trace process — no application code runs in the hot path, and the Collector never handles trace messages directly.
 
 ## Installation
 
@@ -174,46 +174,35 @@ Telemetry Event
       │  (sync call — caller blocks
       │   until tracing is active)
       ▼
-┌─────────────┐   trace messages    ┌──────────────────────┐
-│  Collector   │◄───────────────────│  :erlang.trace/3     │
-│  (GenServer) │   :call, :return,  │  (per traced process)│
-│              │   :in, :out        └──────────────────────┘
-│  - sampling  │
-│  - stack     │   :DOWN / :stop event
-│    building  │──────────┐
-└─────────────┘           │
-                          ▼
-                  ┌───────────────┐
-                  │  Finalize &   │
-                  │  Collapse     │
-                  │  Stack → Path │
-                  └───────┬───────┘
-                          │
-                          ▼
-                  ┌───────────────┐
-                  │  Threshold    │
-                  │  Filter       │
-                  │  duration_us  │
-                  │  >= threshold │
-                  └───────┬───────┘
-                          │ (slow traces only)
-                          ▼
-                  ┌───────────────┐
-                  │ ProfileFilter │
-                  │  - drop child │
-                  │    detail of  │
-                  │    <1% blocks │
-                  └───────┬───────┘
-                          │
-                          ▼
-                  ┌───────────────┐    gRPC FlameOnIngest.Ingest
-                  │   Shipper     │───────────────────────►  flameon.ai
-                  │  (GenServer)  │    pprof + Bearer
-                  │  - batching   │
-                  │  - pprof      │
-                  │    encoding   │
-                  │  - backpressure│
-                  └───────────────┘
+┌─────────────┐  start_session   ┌─────────────────────────┐
+│  Collector   │────────────────►│  TraceSessionSupervisor  │
+│  (GenServer) │                 │  (DynamicSupervisor)     │
+│              │                 └────────────┬─────────────┘
+│  - sampling  │                              │ spawns
+│  - coordi-   │                              ▼
+│    nation    │                 ┌──────────────────────────┐
+└──────┬───────┘                │  TraceSession            │
+       │                        │  (GenServer, per trace)   │
+       │ :stop event            │                          │
+       │ ──► cast :stop ───────►│  ◄── :erlang.trace/3     │
+       │                        │      :call, :return,     │
+       │ monitors session       │      :in, :out           │
+       │ ◄── :DOWN ────────────│                          │
+       │                        │  - stack building        │
+       │                        │  - finalize & collapse   │
+       │                        │  - threshold filter      │
+       │                        │  - profile filter        │
+       │                        └────────────┬─────────────┘
+       │                                     │
+       │                                     ▼
+       │                        ┌───────────────┐  gRPC
+       │                        │   Shipper     │──────►  flameon.ai
+       │                        │  (GenServer)  │  pprof + Bearer
+       │                        │  - batching   │
+       │                        │  - pprof      │
+       │                        │    encoding   │
+       │                        │  - backpressure│
+       │                        └───────────────┘
 ```
 
 ### Supervision Tree
@@ -222,10 +211,11 @@ Telemetry Event
 FlameOn.Client.Supervisor (one_for_one)
 ├── GRPC.Client.Supervisor (DynamicSupervisor)
 ├── FlameOn.Client.Shipper
+├── FlameOn.Client.TraceSessionSupervisor (DynamicSupervisor)
 └── FlameOn.Client.Collector
 ```
 
-Children start in order: the gRPC DynamicSupervisor first, then the Shipper (which opens gRPC connections), then the Collector (which sends completed traces to the Shipper).
+Children start in order: the gRPC DynamicSupervisor first, then the Shipper (which opens gRPC connections), then the TraceSessionSupervisor (which manages per-trace processes), then the Collector (which coordinates telemetry events and spawns trace sessions).
 
 ## Wire Format
 

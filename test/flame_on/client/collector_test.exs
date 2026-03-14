@@ -41,15 +41,25 @@ defmodule FlameOn.Client.CollectorTest do
     shipper = start_supervised!({FlameOn.Client.Shipper, shipper_opts}, id: :test_shipper)
     allow(FlameOn.Client.Shipper.MockAdapter, self(), shipper)
 
+    # Start TraceSessionSupervisor
+    session_sup =
+      start_supervised!(
+        {FlameOn.Client.TraceSessionSupervisor, []},
+        id: :test_session_sup
+      )
+
     collector =
       start_supervised!(
-        {Collector, Keyword.put(collector_opts, :shipper_pid, shipper)},
+        {Collector,
+         collector_opts
+         |> Keyword.put(:shipper_pid, shipper)
+         |> Keyword.put(:trace_session_supervisor, session_sup)},
         id: :test_collector
       )
 
     allow(FlameOn.Client.Shipper.MockAdapter, self(), collector)
 
-    %{collector: collector, shipper: shipper}
+    %{collector: collector, shipper: shipper, session_sup: session_sup}
   end
 
   describe "telemetry attachment" do
@@ -658,6 +668,47 @@ defmodule FlameOn.Client.CollectorTest do
 
       assert_receive {:shipped, [trace_data]}, 5000
       assert trace_data.event_identifier == "override_op"
+    end
+  end
+
+  describe "deadlock prevention" do
+    test "collector responds to calls while traces are active" do
+      defmodule DeadlockHandler do
+        @behaviour FlameOn.Client.EventHandler
+
+        def handle([:test, :event, :start], _measurements, _metadata) do
+          {:capture, %{event_name: "test.event", event_identifier: "deadlock_test"}}
+        end
+
+        def handle(_, _, _), do: :skip
+        def default_threshold_ms(_event), do: 100
+      end
+
+      %{collector: collector} =
+        start_collector(
+          event_handler: DeadlockHandler,
+          events: [{[:test, :event, :start], threshold_ms: 0}]
+        )
+
+      # Spawn multiple processes that generate heavy trace traffic
+      pids =
+        for _ <- 1..5 do
+          spawn(fn ->
+            :telemetry.execute([:test, :event, :start], %{}, %{})
+            # Do CPU work to generate lots of trace messages
+            Enum.reduce(1..1000, 0, fn i, acc -> acc + i end)
+            Process.sleep(500)
+          end)
+        end
+
+      # Give time for traces to start and generate traffic
+      Process.sleep(100)
+
+      # The key assertion: collector must respond within 200ms timeout
+      # With the old architecture this would deadlock under trace message flood
+      assert Collector.active_trace_count(collector) >= 1
+
+      for pid <- pids, do: Process.exit(pid, :kill)
     end
   end
 end
