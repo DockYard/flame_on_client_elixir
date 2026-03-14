@@ -17,7 +17,7 @@ defmodule FlameOn.Client.ShipperTest do
           max_buffer_size: 500,
           server_url: "localhost",
           use_ssl: false,
-          ingest_token: "test-key",
+          api_key: "test-key",
           shipper_adapter: FlameOn.Client.Shipper.MockAdapter
         ],
         opts
@@ -117,7 +117,11 @@ defmodule FlameOn.Client.ShipperTest do
 
       log =
         capture_log(fn ->
-          Shipper.push(pid, %{trace_id: "1", samples: [%{stack_path: "Foo.bar/1", duration_us: 100}]})
+          Shipper.push(pid, %{
+            trace_id: "1",
+            samples: [%{stack_path: "Foo.bar/1", duration_us: 100}]
+          })
+
           Process.sleep(100)
         end)
 

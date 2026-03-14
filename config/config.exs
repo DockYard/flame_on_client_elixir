@@ -2,7 +2,7 @@ import Config
 
 config :flame_on_client,
   capture: false,
-  ingest_token: nil,
+  api_key: nil,
   sample_rate: 0.01,
   function_length_threshold: 0.01,
   events: [

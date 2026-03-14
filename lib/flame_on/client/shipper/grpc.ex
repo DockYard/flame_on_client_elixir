@@ -19,7 +19,7 @@ defmodule FlameOn.Client.Shipper.Grpc do
 
     case GRPC.Stub.connect("#{url}:#{@grpc_port}", connect_opts(config)) do
       {:ok, channel} ->
-        metadata = %{"authorization" => "Bearer #{config.ingest_token}"}
+        metadata = %{"authorization" => "Bearer #{config.api_key}"}
 
         result =
           case Flameon.FlameOnIngest.Stub.ingest(channel, request, metadata: metadata) do

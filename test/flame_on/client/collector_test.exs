@@ -18,9 +18,14 @@ defmodule FlameOn.Client.CollectorTest do
           max_buffer_size: 500,
           server_url: "localhost",
           use_ssl: false,
-          ingest_token: "test-key"
+          api_key: "test-key"
         ],
-        Keyword.take(opts, [:flush_interval_ms, :max_batch_size, :max_buffer_size, :shipper_adapter])
+        Keyword.take(opts, [
+          :flush_interval_ms,
+          :max_batch_size,
+          :max_buffer_size,
+          :shipper_adapter
+        ])
       )
 
     collector_opts =
@@ -32,7 +37,7 @@ defmodule FlameOn.Client.CollectorTest do
           shipper_adapter: FlameOn.Client.Shipper.MockAdapter,
           server_url: "localhost",
           use_ssl: false,
-          ingest_token: "test-key"
+          api_key: "test-key"
         ],
         opts
       )
@@ -95,6 +100,17 @@ defmodule FlameOn.Client.CollectorTest do
   end
 
   describe "telemetry event handling" do
+    test "ignores telemetry for a dead collector" do
+      pid = spawn(fn -> :ok end)
+
+      ref = Process.monitor(pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1000
+
+      assert :ok = Collector.handle_telemetry([:test, :event, :start], %{}, %{}, pid)
+      assert :ok = Collector.handle_telemetry([:test, :event, :stop], %{}, %{}, pid)
+    end
+
     test "starts tracing when handler returns {:capture, info}" do
       defmodule TestHandler do
         @behaviour FlameOn.Client.EventHandler

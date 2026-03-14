@@ -105,10 +105,11 @@ defmodule FlameOn.Client.Shipper do
 
   defp build_config(opts) do
     defaults = %{
-      shipper_adapter: Application.get_env(:flame_on_client, :shipper_adapter, FlameOn.Client.Shipper.Grpc),
+      shipper_adapter:
+        Application.get_env(:flame_on_client, :shipper_adapter, FlameOn.Client.Shipper.Grpc),
       server_url: FlameOn.Client.env_or_config(:server_url, "flameon.ai"),
       use_ssl: FlameOn.Client.env_or_config_bool(:use_ssl, true),
-      ingest_token: Application.get_env(:flame_on_client, :ingest_token),
+      api_key: FlameOn.Client.env_or_config(:api_key, nil),
       flush_interval_ms: Application.get_env(:flame_on_client, :flush_interval_ms, 5_000),
       max_batch_size: Application.get_env(:flame_on_client, :max_batch_size, 50),
       max_buffer_size: Application.get_env(:flame_on_client, :max_buffer_size, 500)

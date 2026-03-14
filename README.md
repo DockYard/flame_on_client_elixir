@@ -33,7 +33,7 @@ end
 if config_env() == :prod do
   config :flame_on_client,
     capture: true,
-    ingest_token: System.get_env("FLAME_ON_INGEST_TOKEN"),
+    api_key: System.get_env("FLAMEON_API_KEY"),
     sample_rate: 0.01,
     function_length_threshold: 0.01
 end
@@ -44,7 +44,7 @@ end
 | Key | Default | Description |
 |-----|---------|-------------|
 | `capture` | `false` | Must be `true` to enable tracing and shipping. When `false`, the client starts an empty supervisor and does nothing. |
-| `ingest_token` | `nil` | API token from your FlameOn account, sent as gRPC metadata |
+| `api_key` | `nil` | API key from your FlameOn account, sent as gRPC metadata |
 | `sample_rate` | `0.01` | Fraction of events to trace (0.0 to 1.0) |
 | `function_length_threshold` | `0.01` | Remove children of blocks below this fraction of total request time (min: `0.005`) |
 | `events` | *(see below)* | List of telemetry events to listen to |

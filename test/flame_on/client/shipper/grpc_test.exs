@@ -35,7 +35,7 @@ defmodule FlameOn.Client.Shipper.GrpcTest do
 
   describe "send_batch/2" do
     test "encodes traces to pprof and attempts gRPC call" do
-      config = %{server_url: "localhost", use_ssl: false, ingest_token: "test-key"}
+      config = %{server_url: "localhost", use_ssl: false, api_key: "test-key"}
 
       # Fire-and-forget: errors are logged but not propagated
       log =
@@ -49,7 +49,7 @@ defmodule FlameOn.Client.Shipper.GrpcTest do
     end
 
     test "strips scheme and trailing slash from server_url" do
-      config = %{server_url: "https://example.com/", use_ssl: false, ingest_token: "test-key"}
+      config = %{server_url: "https://example.com/", use_ssl: false, api_key: "test-key"}
 
       log =
         capture_log(fn ->
@@ -72,7 +72,7 @@ defmodule FlameOn.Client.Shipper.GrpcTest do
     end
 
     test "handles empty batch" do
-      config = %{server_url: "localhost", use_ssl: false, ingest_token: "test-key"}
+      config = %{server_url: "localhost", use_ssl: false, api_key: "test-key"}
 
       log =
         capture_log(fn ->
