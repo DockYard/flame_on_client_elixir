@@ -23,13 +23,25 @@ defmodule FlameOn.Client.Collector do
           collector_pid,
           {:telemetry_event, event, measurements, metadata, self()}
         )
+
+        FlameOn.Client.TraceContext.clear()
       else
         # Start events use call so the caller blocks until tracing is active.
         # Without this, the caller races ahead and intermediate functions are missed.
-        GenServer.call(
-          collector_pid,
-          {:telemetry_event, event, measurements, metadata, self()}
-        )
+        trace_id = generate_trace_id()
+        FlameOn.Client.TraceContext.put_trace_id(trace_id)
+
+        case GenServer.call(
+               collector_pid,
+               {:telemetry_event, event, measurements, metadata, self(), trace_id}
+             ) do
+          {:ok, trace_id} when is_binary(trace_id) ->
+            :ok
+
+          _ ->
+            FlameOn.Client.TraceContext.clear()
+            :ok
+        end
       end
     end)
   end
@@ -106,8 +118,14 @@ defmodule FlameOn.Client.Collector do
   end
 
   @impl true
-  def handle_call({:telemetry_event, event, measurements, metadata, caller_pid}, _from, state) do
-    {reply, new_state} = handle_start_event(event, measurements, metadata, caller_pid, state)
+  def handle_call(
+        {:telemetry_event, event, measurements, metadata, caller_pid, trace_id},
+        _from,
+        state
+      ) do
+    {reply, new_state} =
+      handle_start_event(event, measurements, metadata, caller_pid, trace_id, state)
+
     {:reply, reply, new_state}
   end
 
@@ -121,12 +139,11 @@ defmodule FlameOn.Client.Collector do
     handle_stop_event(caller_pid, state)
   end
 
-  defp handle_start_event(event, measurements, metadata, caller_pid, state) do
+  defp handle_start_event(event, measurements, metadata, caller_pid, trace_id, state) do
     case state.handler.handle(event, measurements, metadata) do
       {:capture, info} ->
         if should_sample?(state.sample_rate) and
              not Map.has_key?(state.active_traces, caller_pid) do
-          trace_id = generate_trace_id()
           threshold_us = Map.get(state.event_thresholds, event, 100_000)
 
           trace_info =
@@ -153,7 +170,7 @@ defmodule FlameOn.Client.Collector do
               )
 
               Process.monitor(session_pid)
-              {:ok, put_in(state, [:active_traces, caller_pid], session_pid)}
+              {{:ok, trace_id}, put_in(state, [:active_traces, caller_pid], session_pid)}
 
             {:error, _reason} ->
               {:ok, state}

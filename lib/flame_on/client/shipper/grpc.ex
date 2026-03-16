@@ -10,7 +10,7 @@ defmodule FlameOn.Client.Shipper.Grpc do
   @impl true
   def send_batch(batch, config) do
     traces = Enum.map(batch, &PprofEncoder.encode/1)
-    request = %Flameon.IngestRequest{traces: traces}
+    request = %FlameOn.IngestRequest{traces: traces}
 
     url =
       config.server_url
@@ -22,11 +22,11 @@ defmodule FlameOn.Client.Shipper.Grpc do
         metadata = %{"authorization" => "Bearer #{config.api_key}"}
 
         result =
-          case Flameon.FlameOnIngest.Stub.ingest(channel, request, metadata: metadata) do
-            {:ok, %Flameon.IngestResponse{success: true}} ->
+          case FlameOn.FlameOnIngest.Stub.ingest(channel, request, metadata: metadata) do
+            {:ok, %FlameOn.IngestResponse{success: true}} ->
               :ok
 
-            {:ok, %Flameon.IngestResponse{success: false, message: message}} ->
+            {:ok, %FlameOn.IngestResponse{success: false, message: message}} ->
               Logger.warning("[FlameOn] gRPC ingest rejected: #{message}")
               {:error, {:rejected, message}}
 
