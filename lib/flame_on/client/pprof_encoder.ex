@@ -5,13 +5,13 @@ defmodule FlameOn.Client.PprofEncoder do
   Input: trace map with %{trace_id, event_name, event_identifier, captured_at, samples}
   where samples are [%{stack_path: "A;B;C", duration_us: N}]
 
-  Output: %Flameon.TraceProfile{} with a fully built pprof Profile
+  Output: %FlameOn.TraceProfile{} with a fully built pprof Profile
   """
 
   def encode(trace) do
     profile = build_profile(trace.samples)
 
-    %Flameon.TraceProfile{
+    %FlameOn.TraceProfile{
       trace_id: trace.trace_id,
       event_name: trace.event_name,
       event_identifier: trace.event_identifier,

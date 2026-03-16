@@ -1,7 +1,6 @@
 defmodule FlameOn.Client.TraceSessionTest do
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
   import Mox
 
   alias FlameOn.Client.Capture.Trace

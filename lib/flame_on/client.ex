@@ -2,14 +2,21 @@ defmodule FlameOn.Client do
   def config do
     %{
       capture: Application.get_env(:flame_on_client, :capture),
+      capture_errors: Application.get_env(:flame_on_client, :capture_errors),
       api_key: env_or_config(:api_key, nil),
       event_handler: Application.get_env(:flame_on_client, :event_handler),
       sample_rate: Application.get_env(:flame_on_client, :sample_rate),
       function_length_threshold:
         Application.get_env(:flame_on_client, :function_length_threshold),
       flush_interval_ms: Application.get_env(:flame_on_client, :flush_interval_ms),
+      error_flush_interval_ms: Application.get_env(:flame_on_client, :error_flush_interval_ms),
       max_batch_size: Application.get_env(:flame_on_client, :max_batch_size),
+      max_error_batch_size: Application.get_env(:flame_on_client, :max_error_batch_size),
       max_buffer_size: Application.get_env(:flame_on_client, :max_buffer_size),
+      max_error_buffer_size: Application.get_env(:flame_on_client, :max_error_buffer_size),
+      service: Application.get_env(:flame_on_client, :service),
+      environment: Application.get_env(:flame_on_client, :environment),
+      release: Application.get_env(:flame_on_client, :release),
       events: Application.get_env(:flame_on_client, :events)
     }
   end

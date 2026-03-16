@@ -23,7 +23,7 @@ defmodule FlameOn.Client.PprofEncoderTest do
       trace = build_trace()
       result = PprofEncoder.encode(trace)
 
-      assert %Flameon.TraceProfile{} = result
+      assert %FlameOn.TraceProfile{} = result
       assert result.trace_id == "trace-123"
       assert result.event_name == "web.request"
       assert result.event_identifier == "GET /users"
@@ -43,12 +43,13 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "deduplicates string table entries" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "A;B;C", duration_us: 100},
-          %{stack_path: "A;B;D", duration_us: 200}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "A;B;C", duration_us: 100},
+            %{stack_path: "A;B;D", duration_us: 200}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       profile = result.profile
@@ -62,12 +63,13 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "creates one function per unique frame" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "A;B", duration_us: 100},
-          %{stack_path: "A;C", duration_us: 200}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "A;B", duration_us: 100},
+            %{stack_path: "A;C", duration_us: 200}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       profile = result.profile
@@ -77,12 +79,13 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "creates one location per unique frame" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "A;B", duration_us: 100},
-          %{stack_path: "A;C", duration_us: 200}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "A;B", duration_us: 100},
+            %{stack_path: "A;C", duration_us: 200}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       profile = result.profile
@@ -91,11 +94,12 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "samples reference correct location IDs" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "A;B", duration_us: 100}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "A;B", duration_us: 100}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       profile = result.profile
@@ -109,11 +113,12 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "sample values encode self_us and total_us" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "A;B", duration_us: 500}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "A;B", duration_us: 500}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       [sample] = result.profile.sample
@@ -139,11 +144,12 @@ defmodule FlameOn.Client.PprofEncoderTest do
     end
 
     test "location_ids follow pprof convention (leaf-first / innermost-first)" do
-      trace = build_trace(%{
-        samples: [
-          %{stack_path: "root;middle;leaf", duration_us: 100}
-        ]
-      })
+      trace =
+        build_trace(%{
+          samples: [
+            %{stack_path: "root;middle;leaf", duration_us: 100}
+          ]
+        })
 
       result = PprofEncoder.encode(trace)
       profile = result.profile

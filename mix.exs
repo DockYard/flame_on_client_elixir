@@ -25,6 +25,7 @@ defmodule FlameOnClient.MixProject do
   defp deps do
     [
       {:jason, "~> 1.0"},
+      {:plug, "~> 1.16"},
       {:telemetry, "~> 1.0"},
       {:mox, "~> 1.0", only: :test},
       {:castore, "~> 1.0"},

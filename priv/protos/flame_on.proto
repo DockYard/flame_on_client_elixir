@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package flame_on;
+
+import "google/protobuf/timestamp.proto";
+import "perftools/profiles/profile.proto";
+
+service FlameOnIngest {
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+}
+
+service FlameOnErrorIngest {
+  rpc IngestErrors(IngestErrorsRequest) returns (IngestErrorsResponse);
+}
+
+message IngestRequest {
+  repeated TraceProfile traces = 1;
+}
+
+message TraceProfile {
+  string trace_id = 1;
+  reserved 2; // was: release (no longer sent by client)
+  string event_name = 3;
+  string event_identifier = 4;
+  perftools.profiles.Profile profile = 5;
+}
+
+message IngestResponse {
+  bool success = 1;
+  int32 ingested = 2;
+  string message = 3;
+}
+
+message IngestErrorsRequest {
+  repeated ErrorEvent events = 1;
+}
+
+message IngestErrorsResponse {
+  bool success = 1;
+  int32 ingested = 2;
+  repeated string warnings = 3;
+}
+
+message ErrorEvent {
+  string event_id = 1;
+  google.protobuf.Timestamp occurred_at = 2;
+  string platform = 3;
+  string environment = 4;
+  string service = 5;
+  string route = 6;
+  string release = 7;
+  string severity = 8;
+  string message = 9;
+  bool handled = 10;
+  string trace_id = 11;
+  string span_id = 12;
+  repeated string fingerprint = 13;
+  repeated Exception exceptions = 14;
+  RequestContext request = 15;
+  UserContext user = 16;
+  repeated Breadcrumb breadcrumbs = 17;
+  repeated KeyValue tags = 18;
+  repeated KeyValue contexts = 19;
+}
+
+message Exception {
+  string type = 1;
+  string value = 2;
+  StackTrace stack_trace = 3;
+}
+
+message StackTrace {
+  repeated StackFrame frames = 1;
+}
+
+message StackFrame {
+  string function = 1;
+  string module = 2;
+  string file = 3;
+  uint32 line = 4;
+  uint32 column = 5;
+  bool in_app = 6;
+  string abs_path = 7;
+  string context_line = 8;
+  repeated string pre_context = 9;
+  repeated string post_context = 10;
+}
+
+message RequestContext {
+  string method = 1;
+  string url = 2;
+  string route = 3;
+  repeated KeyValue headers = 4;
+  string remote_addr = 5;
+}
+
+message UserContext {
+  string id = 1;
+  string email = 2;
+  string username = 3;
+  string ip_address = 4;
+}
+
+message Breadcrumb {
+  google.protobuf.Timestamp timestamp = 1;
+  string category = 2;
+  string message = 3;
+  string type = 4;
+  string level = 5;
+  repeated KeyValue data = 6;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}

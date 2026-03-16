@@ -5,6 +5,7 @@ defmodule FlameOn.Client.CollectorTest do
   import Mox
 
   alias FlameOn.Client.Collector
+  alias FlameOn.Client.TraceContext
 
   setup :verify_on_exit!
 
@@ -109,6 +110,39 @@ defmodule FlameOn.Client.CollectorTest do
 
       assert :ok = Collector.handle_telemetry([:test, :event, :start], %{}, %{}, pid)
       assert :ok = Collector.handle_telemetry([:test, :event, :stop], %{}, %{}, pid)
+    end
+
+    test "sets and clears the current trace id around telemetry start and stop" do
+      defmodule TraceContextHandler do
+        @behaviour FlameOn.Client.EventHandler
+
+        def handle([:test, :event, :start], _measurements, _metadata) do
+          {:capture, %{event_name: "test.event", event_identifier: "trace_context"}}
+        end
+
+        def handle(_, _, _), do: :skip
+        def default_threshold_ms(_event), do: 0
+      end
+
+      %{collector: _collector} = start_collector(event_handler: TraceContextHandler)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :telemetry.execute([:test, :event, :start], %{}, %{})
+          send(parent, {:trace_id_after_start, TraceContext.current_trace_id()})
+          :telemetry.execute([:test, :event, :stop], %{}, %{})
+          send(parent, {:trace_id_after_stop, TraceContext.current_trace_id()})
+        end)
+
+      assert_receive {:trace_id_after_start, trace_id}, 1000
+      assert is_binary(trace_id)
+      assert trace_id != ""
+
+      assert_receive {:trace_id_after_stop, nil}, 1000
+
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1000
     end
 
     test "starts tracing when handler returns {:capture, info}" do
