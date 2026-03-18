@@ -18,7 +18,7 @@ defmodule FlameOn.Client.TraceSessionTest do
           max_buffer_size: 500,
           server_url: "localhost",
           use_ssl: false,
-          ingest_token: "test-key"
+          api_key: "test-key"
         ],
         opts
       )
@@ -265,6 +265,228 @@ defmodule FlameOn.Client.TraceSessionTest do
       Process.sleep(500)
 
       refute_receive {:shipped, _}, 200
+    end
+  end
+
+  describe "cross-process call tracking via seq_trace" do
+    test "replaces sleep with cross-process call block when traced process calls a GenServer" do
+      shipper = start_shipper(flush_interval_ms: 50)
+      test_pid = self()
+
+      FlameOn.Client.Shipper.MockAdapter
+      |> expect(:send_batch, fn batch, _config ->
+        send(test_pid, {:shipped, batch})
+        :ok
+      end)
+
+      allow(FlameOn.Client.Shipper.MockAdapter, self(), shipper)
+
+      # Start a simple GenServer that the traced process will call
+      {:ok, target_server} =
+        Agent.start_link(fn -> 0 end, name: :"TestAgent_#{System.unique_integer([:positive])}")
+
+      # Start SeqTraceRouter
+      seq_trace_router =
+        start_supervised!(FlameOn.Client.SeqTraceRouter, id: :test_seq_trace_router)
+
+      seq_trace_label = :erlang.unique_integer([:positive, :monotonic])
+
+      # Spawn target that waits for tracing to be set up before doing work
+      target =
+        spawn(fn ->
+          receive do
+            :go ->
+              # Set seq_trace token (normally done by Collector.handle_telemetry)
+              :seq_trace.set_token(:label, seq_trace_label)
+              :seq_trace.set_token(:send, true)
+              :seq_trace.set_token(:receive, true)
+              :seq_trace.set_token(:timestamp, true)
+
+              # Make a GenServer.call to the Agent — this is the cross-process call
+              Agent.get(target_server, fn state ->
+                Process.sleep(10)
+                state
+              end)
+          end
+        end)
+
+      trace_info = %{
+        event_name: "test.event",
+        event_identifier: "cross_process_test",
+        trace_id: "abc-123",
+        threshold_us: 0
+      }
+
+      {:ok, _session} =
+        TraceSession.start_link(
+          traced_pid: target,
+          trace_info: trace_info,
+          shipper_pid: shipper,
+          function_length_threshold: 0.001,
+          seq_trace_label: seq_trace_label,
+          seq_trace_router: seq_trace_router
+        )
+
+      # Now that tracing is active, trigger the work
+      send(target, :go)
+
+      assert_receive {:shipped, [trace_data]}, 5000
+
+      # The shipped samples should contain a CALL entry for the Agent
+      call_samples =
+        Enum.filter(trace_data.samples, fn sample ->
+          String.contains?(sample.stack_path, "CALL")
+        end)
+
+      assert length(call_samples) > 0,
+             "Expected cross-process CALL block in samples, got: #{inspect(Enum.map(trace_data.samples, & &1.stack_path))}"
+
+      # Cleanup
+      Agent.stop(target_server)
+    end
+
+    test "cross-process call block includes the registered name of the target process" do
+      shipper = start_shipper(flush_interval_ms: 50)
+      test_pid = self()
+
+      FlameOn.Client.Shipper.MockAdapter
+      |> expect(:send_batch, fn batch, _config ->
+        send(test_pid, {:shipped, batch})
+        :ok
+      end)
+
+      allow(FlameOn.Client.Shipper.MockAdapter, self(), shipper)
+
+      agent_name = :"TestNamedAgent_#{System.unique_integer([:positive])}"
+      {:ok, target_server} = Agent.start_link(fn -> 0 end, name: agent_name)
+
+      # Reuse the same router from the first test (ETS table is shared)
+      seq_trace_router =
+        start_supervised!(FlameOn.Client.SeqTraceRouter, id: :test_seq_trace_router_named)
+
+      seq_trace_label = :erlang.unique_integer([:positive, :monotonic])
+
+      target =
+        spawn(fn ->
+          receive do
+            :go ->
+              :seq_trace.set_token(:label, seq_trace_label)
+              :seq_trace.set_token(:send, true)
+              :seq_trace.set_token(:receive, true)
+              :seq_trace.set_token(:timestamp, true)
+
+              Agent.get(target_server, fn state ->
+                Process.sleep(10)
+                state
+              end)
+          end
+        end)
+
+      trace_info = %{
+        event_name: "test.event",
+        event_identifier: "named_process_test",
+        trace_id: "abc-456",
+        threshold_us: 0
+      }
+
+      {:ok, _session} =
+        TraceSession.start_link(
+          traced_pid: target,
+          trace_info: trace_info,
+          shipper_pid: shipper,
+          function_length_threshold: 0.001,
+          seq_trace_label: seq_trace_label,
+          seq_trace_router: seq_trace_router
+        )
+
+      send(target, :go)
+
+      assert_receive {:shipped, [trace_data]}, 5000
+
+      call_sample =
+        Enum.find(trace_data.samples, fn sample ->
+          String.contains?(sample.stack_path, "CALL")
+        end)
+
+      assert call_sample != nil,
+             "Expected cross-process CALL block, got: #{inspect(Enum.map(trace_data.samples, & &1.stack_path))}"
+
+      assert String.contains?(call_sample.stack_path, inspect(agent_name)),
+             "Expected agent name #{inspect(agent_name)} in stack path, got: #{call_sample.stack_path}"
+
+      Agent.stop(target_server)
+    end
+
+    test "uses callback module name for unnamed GenServer processes" do
+      shipper = start_shipper(flush_interval_ms: 50)
+      test_pid = self()
+
+      FlameOn.Client.Shipper.MockAdapter
+      |> expect(:send_batch, fn batch, _config ->
+        send(test_pid, {:shipped, batch})
+        :ok
+      end)
+
+      allow(FlameOn.Client.Shipper.MockAdapter, self(), shipper)
+
+      # Start an unnamed Agent (no registered name)
+      {:ok, target_server} = Agent.start_link(fn -> 0 end)
+
+      seq_trace_router =
+        start_supervised!(FlameOn.Client.SeqTraceRouter, id: :test_seq_trace_router_unnamed)
+
+      seq_trace_label = :erlang.unique_integer([:positive, :monotonic])
+
+      target =
+        spawn(fn ->
+          receive do
+            :go ->
+              :seq_trace.set_token(:label, seq_trace_label)
+              :seq_trace.set_token(:send, true)
+              :seq_trace.set_token(:receive, true)
+              :seq_trace.set_token(:timestamp, true)
+
+              Agent.get(target_server, fn state ->
+                Process.sleep(10)
+                state
+              end)
+          end
+        end)
+
+      trace_info = %{
+        event_name: "test.event",
+        event_identifier: "unnamed_process_test",
+        trace_id: "abc-789",
+        threshold_us: 0
+      }
+
+      {:ok, _session} =
+        TraceSession.start_link(
+          traced_pid: target,
+          trace_info: trace_info,
+          shipper_pid: shipper,
+          function_length_threshold: 0.001,
+          seq_trace_label: seq_trace_label,
+          seq_trace_router: seq_trace_router
+        )
+
+      send(target, :go)
+
+      assert_receive {:shipped, [trace_data]}, 5000
+
+      call_sample =
+        Enum.find(trace_data.samples, fn sample ->
+          String.contains?(sample.stack_path, "CALL")
+        end)
+
+      assert call_sample != nil,
+             "Expected cross-process CALL block, got: #{inspect(Enum.map(trace_data.samples, & &1.stack_path))}"
+
+      # Should show the Agent callback module, not "<process>"
+      refute String.contains?(call_sample.stack_path, "<process>"),
+             "Expected module name instead of <process>, got: #{call_sample.stack_path}"
+
+      Agent.stop(target_server)
     end
   end
 

@@ -19,6 +19,8 @@ defmodule FlameOn.Client.Collector do
   def handle_telemetry(event, measurements, metadata, collector_pid) do
     safe_collector_call(collector_pid, fn ->
       if stop_event?(event) do
+        :seq_trace.set_token([])
+
         GenServer.cast(
           collector_pid,
           {:telemetry_event, event, measurements, metadata, self()}
@@ -35,6 +37,13 @@ defmodule FlameOn.Client.Collector do
                collector_pid,
                {:telemetry_event, event, measurements, metadata, self(), trace_id}
              ) do
+          {:ok, trace_id, seq_trace_label} when is_binary(trace_id) ->
+            :seq_trace.set_token(:label, seq_trace_label)
+            :seq_trace.set_token(:send, true)
+            :seq_trace.set_token(:receive, true)
+            :seq_trace.set_token(:timestamp, true)
+            :ok
+
           {:ok, trace_id} when is_binary(trace_id) ->
             :ok
 
@@ -104,7 +113,8 @@ defmodule FlameOn.Client.Collector do
        active_traces: %{},
        handler_ids: handler_ids,
        event_thresholds: event_thresholds,
-       trace_session_supervisor: config.trace_session_supervisor
+       trace_session_supervisor: config.trace_session_supervisor,
+       seq_trace_router: config.seq_trace_router
      }}
   end
 
@@ -153,11 +163,15 @@ defmodule FlameOn.Client.Collector do
               started_at: System.system_time(:microsecond)
             })
 
+          seq_trace_label = :erlang.unique_integer([:positive, :monotonic])
+
           session_opts = [
             traced_pid: caller_pid,
             trace_info: trace_info,
             shipper_pid: state.shipper_pid,
-            function_length_threshold: state.function_length_threshold
+            function_length_threshold: state.function_length_threshold,
+            seq_trace_label: seq_trace_label,
+            seq_trace_router: state.seq_trace_router
           ]
 
           case TraceSessionSupervisor.start_session(
@@ -170,7 +184,9 @@ defmodule FlameOn.Client.Collector do
               )
 
               Process.monitor(session_pid)
-              {{:ok, trace_id}, put_in(state, [:active_traces, caller_pid], session_pid)}
+
+              {{:ok, trace_id, seq_trace_label},
+               put_in(state, [:active_traces, caller_pid], session_pid)}
 
             {:error, _reason} ->
               {:ok, state}
@@ -253,7 +269,8 @@ defmodule FlameOn.Client.Collector do
       function_length_threshold:
         Application.get_env(:flame_on_client, :function_length_threshold, 0.01),
       shipper_pid: FlameOn.Client.Shipper,
-      trace_session_supervisor: FlameOn.Client.TraceSessionSupervisor
+      trace_session_supervisor: FlameOn.Client.TraceSessionSupervisor,
+      seq_trace_router: FlameOn.Client.SeqTraceRouter
     }
 
     Map.merge(defaults, Map.new(opts))

@@ -33,6 +33,7 @@ defmodule FlameOn.Client.Application do
     if Application.get_env(:flame_on_client, :capture, false) do
       children ++
         [
+          {FlameOn.Client.SeqTraceRouter, name: FlameOn.Client.SeqTraceRouter},
           {FlameOn.Client.Shipper, name: FlameOn.Client.Shipper},
           {FlameOn.Client.TraceSessionSupervisor, name: FlameOn.Client.TraceSessionSupervisor},
           {FlameOn.Client.Collector, name: FlameOn.Client.Collector}

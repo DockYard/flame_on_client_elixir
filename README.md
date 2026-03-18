@@ -9,10 +9,11 @@ It can also report structured runtime errors to FlameOn over gRPC.
 1. **Telemetry events** fire in your application (Phoenix requests, Oban jobs, LiveView events, etc.)
 2. The **Collector** receives the event synchronously (via `GenServer.call`), rolls the dice against your sample rate, and spawns a **TraceSession** process (via `DynamicSupervisor`) that calls `:erlang.trace/3` on the calling process — the caller blocks until tracing is active, ensuring the complete call chain is captured
 3. Trace messages (`:call`, `:return_to`, scheduling in/out) stream into the **TraceSession** (not the Collector), which builds a hierarchical call stack in real time. This keeps the Collector's mailbox clear so it stays responsive to new telemetry events under load.
-4. When the traced process exits (or the corresponding `:stop` telemetry event fires), the TraceSession **finalizes** the stack into a block tree, then **collapses** it into root-to-leaf stack paths with durations, and terminates
-5. **Threshold filtering** drops traces whose total duration is below the event's configured threshold — only slow traces get shipped
-6. The **ProfileFilter** removes the children of any block whose inclusive duration is below the `function_length_threshold` (default 1%) — the block itself is kept as a leaf with its full duration, but its sub-call detail is discarded to reduce noise and payload size
-7. The **Shipper** batches filtered stacks, encodes each trace as a [pprof](https://github.com/google/pprof/blob/main/proto/profile.proto) `Profile`, and ships them to FlameOn over gRPC
+4. **Cross-process call tracking**: The Collector sets an Erlang `:seq_trace` token on the traced process. When the traced process makes a `GenServer.call` to another process, the token propagates through the BEAM's message passing, generating events that the **SeqTraceRouter** forwards to the appropriate TraceSession. This replaces opaque `SLEEP` blocks with identified `CALL <ProcessName>` blocks showing which process handled the work and how long it took — no need to trace the target process directly.
+5. When the traced process exits (or the corresponding `:stop` telemetry event fires), the TraceSession **finalizes** the stack into a block tree, injects any completed cross-process call data into matching sleep blocks, then **collapses** it into root-to-leaf stack paths with durations, and terminates
+6. **Threshold filtering** drops traces whose total duration is below the event's configured threshold — only slow traces get shipped
+7. The **ProfileFilter** removes the children of any block whose inclusive duration is below the `function_length_threshold` (default 1%) — the block itself is kept as a leaf with its full duration, but its sub-call detail is discarded to reduce noise and payload size
+8. The **Shipper** batches filtered stacks, encodes each trace as a [pprof](https://github.com/google/pprof/blob/main/proto/profile.proto) `Profile`, and ships them to FlameOn over gRPC
 
 The only synchronous overhead on the traced process is the initial trace setup (step 2). After that, trace messages flow asynchronously to a dedicated per-trace process — no application code runs in the hot path, and the Collector never handles trace messages directly.
 
@@ -51,7 +52,7 @@ end
 |-----|---------|-------------|
 | `capture` | `false` | Must be `true` to enable tracing and shipping. When `false`, the client starts an empty supervisor and does nothing. |
 | `capture_errors` | `false` | Must be `true` to enable runtime error batching and shipping. |
-| `api_key` | `nil` | API key from your FlameOn account, sent as gRPC metadata |
+| `api_key` | `nil` | API key from your FlameOn account, sent as gRPC metadata. Also reads from `FLAMEON_API_KEY` env var. |
 | `before_send` | `nil` | Optional `fn event -> event | nil end` hook to mutate or drop outgoing error events |
 | `logger_fallback` | `false` | Attach a logger handler that turns error-level logger events into FlameOn error events |
 | `service` | `"unknown"` | Service name attached to shipped error events |
@@ -355,14 +356,18 @@ Telemetry Event
 │  - sampling  │                              │ spawns
 │  - coordi-   │                              ▼
 │    nation    │                 ┌──────────────────────────┐
-└──────┬───────┘                │  TraceSession            │
-       │                        │  (GenServer, per trace)   │
-       │ :stop event            │                          │
-       │ ──► cast :stop ───────►│  ◄── :erlang.trace/3     │
+│  - sets      │                │  TraceSession            │
+│    seq_trace │                │  (GenServer, per trace)   │
+│    token     │                │                          │
+└──────┬───────┘                │  ◄── :erlang.trace/3     │
        │                        │      :call, :return,     │
-       │ monitors session       │      :in, :out           │
+       │ :stop event            │      :in, :out           │
+       │ ──► cast :stop ───────►│                          │
+       │                        │  ◄── :seq_trace msgs     │
+       │ monitors session       │      (via SeqTraceRouter)│
        │ ◄── :DOWN ────────────│                          │
        │                        │  - stack building        │
+       │                        │  - cross-process calls   │
        │                        │  - finalize & collapse   │
        │                        │  - threshold filter      │
        │                        │  - profile filter        │
@@ -377,6 +382,12 @@ Telemetry Event
        │                        │    encoding   │
        │                        │  - backpressure│
        │                        └───────────────┘
+
+┌──────────────────────────┐
+│  SeqTraceRouter          │  VM-global seq_trace system tracer
+│  (GenServer + ETS)       │  Routes seq_trace messages to the
+│  - label → session ETS   │  correct TraceSession by label
+└──────────────────────────┘
 ```
 
 ### Supervision Tree
@@ -384,12 +395,13 @@ Telemetry Event
 ```
 FlameOn.Client.Supervisor (one_for_one)
 ├── GRPC.Client.Supervisor (DynamicSupervisor)
+├── FlameOn.Client.SeqTraceRouter
 ├── FlameOn.Client.Shipper
 ├── FlameOn.Client.TraceSessionSupervisor (DynamicSupervisor)
 └── FlameOn.Client.Collector
 ```
 
-Children start in order: the gRPC DynamicSupervisor first, then the Shipper (which opens gRPC connections), then the TraceSessionSupervisor (which manages per-trace processes), then the Collector (which coordinates telemetry events and spawns trace sessions).
+Children start in order: the gRPC DynamicSupervisor first, then the SeqTraceRouter (which registers as the VM's `:seq_trace` system tracer), then the Shipper (which opens gRPC connections), then the TraceSessionSupervisor (which manages per-trace processes), then the Collector (which coordinates telemetry events and spawns trace sessions).
 
 ## Wire Format
 
@@ -436,7 +448,20 @@ Each `TraceProfile` wraps trace metadata alongside a standard [pprof `Profile`](
 - **`sample`** — one entry per collapsed stack path, with `location_id` references (in pprof convention: innermost/leaf frame first, outermost/root frame last) and `[self_us, total_us]` values
 - **`sample_type`** — declares the value types as `self_us` and `total_us` in `microseconds`
 
-Stack paths use semicolons as delimiters in the collapsed format, matching the standard used by flame graph tools. Sleep time (process scheduled out) appears as `SLEEP` in the path.
+Stack paths use semicolons as delimiters in the collapsed format, matching the standard used by flame graph tools. Sleep time (process scheduled out) appears as `SLEEP` in the path. When a sleep is attributable to a cross-process `GenServer.call`, a `CALL` child appears under the `SLEEP` block with the following format:
+
+```
+CALL <ProcessName> <sanitized message>
+```
+
+- **Process name**: the registered name (e.g. `MyApp.Repo`), the OTP callback module from `$initial_call` for unnamed GenServers (e.g. `MyApp.Worker`), or `<process>` as a fallback
+- **Sanitized message**: the `GenServer.call` request with structure preserved at the top level — atoms and numbers are kept as-is, while strings become `"..."`, maps become `"%{...}"`, functions become `"fn"`, PIDs become `"pid"`, and nested tuples/lists become `"tuple"`/`"list"`
+
+For example, a call like `GenServer.call(repo, {:query, "SELECT ...", %{timeout: 5000}})` appears as:
+
+```
+CALL MyApp.Repo {:query, "...", "%{...}"}
+```
 
 ## Development
 

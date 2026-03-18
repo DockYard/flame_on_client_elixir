@@ -38,11 +38,26 @@ defmodule FlameOn.Client.CollapsedStacks do
 
   def format_function(:sleep), do: "SLEEP"
 
+  def format_function({:cross_process_call, _pid, name}) do
+    "CALL #{format_process_name(name)}"
+  end
+
+  def format_function({:cross_process_call, _pid, name, message_form}) do
+    "CALL #{format_process_name(name)} #{format_message_form(message_form)}"
+  end
+
   def format_function({:root, event_name, event_identifier}) do
     "#{event_name} #{event_identifier}"
   end
 
   def format_function({module, function, arity}) do
     "#{module}.#{function}/#{arity}"
+  end
+
+  defp format_process_name(nil), do: "<process>"
+  defp format_process_name(name) when is_atom(name), do: inspect(name)
+
+  defp format_message_form(form) do
+    inspect(form, charlists: :as_lists)
   end
 end

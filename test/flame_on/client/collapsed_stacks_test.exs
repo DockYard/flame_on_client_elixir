@@ -267,5 +267,29 @@ defmodule FlameOn.Client.CollapsedStacksTest do
       assert CollapsedStacks.format_function({:root, "phoenix.request", "GET /users/:id"}) ==
                "phoenix.request GET /users/:id"
     end
+
+    test "formats cross-process call with registered name" do
+      assert CollapsedStacks.format_function({:cross_process_call, self(), MyApp.Repo}) ==
+               "CALL MyApp.Repo"
+    end
+
+    test "formats cross-process call without registered name" do
+      assert CollapsedStacks.format_function({:cross_process_call, self(), nil}) ==
+               "CALL <process>"
+    end
+
+    test "formats cross-process call with message form" do
+      assert CollapsedStacks.format_function(
+               {:cross_process_call, self(), MyApp.Repo, {:get, :user, 42}}
+             ) ==
+               "CALL MyApp.Repo {:get, :user, 42}"
+    end
+
+    test "formats cross-process call with sanitized message" do
+      assert CollapsedStacks.format_function(
+               {:cross_process_call, self(), MyApp.Worker, {:update, "%{...}", "..."}}
+             ) ==
+               ~s(CALL MyApp.Worker {:update, "%{...}", "..."})
+    end
   end
 end

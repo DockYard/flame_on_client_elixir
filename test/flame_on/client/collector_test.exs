@@ -54,12 +54,17 @@ defmodule FlameOn.Client.CollectorTest do
         id: :test_session_sup
       )
 
+    # Start SeqTraceRouter
+    seq_trace_router =
+      start_supervised!(FlameOn.Client.SeqTraceRouter, id: :test_seq_trace_router)
+
     collector =
       start_supervised!(
         {Collector,
          collector_opts
          |> Keyword.put(:shipper_pid, shipper)
-         |> Keyword.put(:trace_session_supervisor, session_sup)},
+         |> Keyword.put(:trace_session_supervisor, session_sup)
+         |> Keyword.put(:seq_trace_router, seq_trace_router)},
         id: :test_collector
       )
 
