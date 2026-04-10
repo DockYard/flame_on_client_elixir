@@ -6,7 +6,7 @@ defmodule FlameOn.Client.NativeProcessor do
 
   require Logger
 
-  @version Mix.Project.config()[:version]
+  @processor_version Application.compile_env(:flame_on_client, :processor_version, "0.0.1")
   @github_repo "DockYard/flame_on_processor"
   @nif_name "libflame_on_processor_nif"
 
@@ -71,7 +71,7 @@ defmodule FlameOn.Client.NativeProcessor do
   # Download URL
 
   defp download_url(target_triple) do
-    "https://github.com/#{@github_repo}/releases/download/v#{@version}/flame_on_processor-nif-#{target_triple}.tar.gz"
+    "https://github.com/#{@github_repo}/releases/download/v#{@processor_version}/flame_on_processor-nif-#{target_triple}.tar.gz"
   end
 
   @doc """
