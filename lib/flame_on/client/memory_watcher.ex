@@ -75,20 +75,25 @@ defmodule FlameOn.Client.MemoryWatcher do
   end
 
   defp detect_system_memory do
-    # Try :memsup first, fall back to a reasonable default
-    try do
-      data = :memsup.get_system_memory_data()
-      total = Keyword.get(data, :total_memory, 0)
+    # Try :memsup (from os_mon) if available, fall back to a reasonable default.
+    # Use apply/3 to avoid compile-time warning when os_mon isn't loaded.
+    if Code.ensure_loaded?(:memsup) do
+      try do
+        data = apply(:memsup, :get_system_memory_data, [])
+        total = Keyword.get(data, :total_memory, 0)
 
-      if total > 0 do
-        trunc(total * 0.8)
-      else
-        default_fallback_memory()
+        if total > 0 do
+          trunc(total * 0.8)
+        else
+          default_fallback_memory()
+        end
+      rescue
+        _ -> default_fallback_memory()
+      catch
+        _, _ -> default_fallback_memory()
       end
-    rescue
-      _ -> default_fallback_memory()
-    catch
-      _, _ -> default_fallback_memory()
+    else
+      default_fallback_memory()
     end
   end
 
