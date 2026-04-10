@@ -9,7 +9,7 @@ defmodule FlameOn.Client.Shipper.Grpc do
 
   @impl true
   def send_batch(batch, config) do
-    traces = Enum.map(batch, &PprofEncoder.encode/1)
+    traces = Enum.map(batch, &encode_trace/1)
     request = %FlameOn.IngestRequest{traces: traces}
 
     url =
@@ -55,6 +55,23 @@ defmodule FlameOn.Client.Shipper.Grpc do
   end
 
   def connect_opts(%{use_ssl: false}), do: []
+
+  # When the native Zig processor has already produced a serialized protobuf
+  # binary, decode it into a Profile struct. Otherwise use PprofEncoder.
+  defp encode_trace(%{profile_binary: binary} = trace) when is_binary(binary) do
+    profile = Perftools.Profiles.Profile.decode(binary)
+
+    %FlameOn.TraceProfile{
+      trace_id: trace.trace_id,
+      event_name: trace.event_name,
+      event_identifier: trace.event_identifier,
+      profile: profile
+    }
+  end
+
+  defp encode_trace(trace) do
+    PprofEncoder.encode(trace)
+  end
 
   # Workaround for grpc 0.11.5 disconnect bug:
   # https://github.com/elixir-grpc/grpc/issues/492

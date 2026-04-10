@@ -14,6 +14,7 @@ defmodule FlameOn.Client.TraceSession do
   require Logger
 
   alias FlameOn.Client.Capture.Trace
+  alias FlameOn.Client.NativeProcessor
   alias FlameOn.Client.ProfileFilter
   alias FlameOn.Client.SeqTraceRouter
   alias FlameOn.Client.Shipper
@@ -501,38 +502,86 @@ defmodule FlameOn.Client.TraceSession do
     total_duration = Enum.sum(Map.values(stacks))
 
     if total_duration >= trace.threshold_us and map_size(stacks) > 0 do
-      # Convert map to sample list (already in collapsed stacks format)
-      samples =
-        Enum.map(stacks, fn {path, duration} ->
-          %{stack_path: path, duration_us: duration}
-        end)
+      log_top_stacks(stacks)
 
-      Logger.debug(fn ->
-        top =
-          samples
-          |> Enum.sort_by(& &1.duration_us, :desc)
-          |> Enum.take(20)
-          |> Enum.map(fn s -> "  #{s.duration_us}us  #{s.stack_path}" end)
-          |> Enum.join("\n")
+      # Try native processor first, fall back to Elixir
+      {samples, profile} = process_stacks(stacks, state.function_length_threshold)
 
-        "[FlameOn] Collapsed stacks (top 20 by duration):\n#{top}"
+      payload =
+        %{
+          trace_id: trace.trace_id,
+          event_name: trace.event_name,
+          event_identifier: trace.event_identifier,
+          duration_us: total_duration,
+          captured_at: Map.get(trace, :started_at, System.system_time(:microsecond))
+        }
+        |> put_profile_or_samples(samples, profile)
+
+      Shipper.push(state.shipper_pid, payload)
+    end
+  end
+
+  # Try the native Zig processor. If it returns a pre-encoded protobuf binary,
+  # we pass that directly as :profile. Otherwise fall back to the Elixir
+  # ProfileFilter and pass :samples for PprofEncoder to handle downstream.
+  defp process_stacks(stacks, threshold) do
+    case try_native_processor(stacks, threshold) do
+      {:ok, profile_binary} ->
+        {nil, profile_binary}
+
+      {:error, _reason} ->
+        samples = elixir_filter_stacks(stacks, threshold)
+        {samples, nil}
+    end
+  end
+
+  defp try_native_processor(stacks, threshold) do
+    if NativeProcessor.available?() do
+      NativeProcessor.process_stacks(stacks, threshold)
+    else
+      {:error, :nif_not_loaded}
+    end
+  rescue
+    e ->
+      Logger.warning("[FlameOn] Native processor crashed: #{inspect(e)}, using Elixir fallback")
+      {:error, :native_crash}
+  catch
+    kind, reason ->
+      Logger.warning(
+        "[FlameOn] Native processor failed (#{kind}): #{inspect(reason)}, using Elixir fallback"
+      )
+
+      {:error, :native_crash}
+  end
+
+  defp elixir_filter_stacks(stacks, threshold) do
+    samples =
+      Enum.map(stacks, fn {path, duration} ->
+        %{stack_path: path, duration_us: duration}
       end)
 
-      # ProfileFilter still works -- but now operates on 1K-10K samples, not 100K-1M
-      filtered =
-        ProfileFilter.filter(samples,
-          function_length_threshold: state.function_length_threshold
-        )
+    ProfileFilter.filter(samples, function_length_threshold: threshold)
+  end
 
-      Shipper.push(state.shipper_pid, %{
-        trace_id: trace.trace_id,
-        event_name: trace.event_name,
-        event_identifier: trace.event_identifier,
-        duration_us: total_duration,
-        captured_at: Map.get(trace, :started_at, System.system_time(:microsecond)),
-        samples: filtered
-      })
-    end
+  defp put_profile_or_samples(payload, nil, profile_binary) when is_binary(profile_binary) do
+    Map.put(payload, :profile_binary, profile_binary)
+  end
+
+  defp put_profile_or_samples(payload, samples, nil) when is_list(samples) do
+    Map.put(payload, :samples, samples)
+  end
+
+  defp log_top_stacks(stacks) do
+    Logger.debug(fn ->
+      top =
+        stacks
+        |> Enum.sort_by(fn {_path, dur} -> dur end, :desc)
+        |> Enum.take(20)
+        |> Enum.map(fn {path, dur} -> "  #{dur}us  #{path}" end)
+        |> Enum.join("\n")
+
+      "[FlameOn] Collapsed stacks (top 20 by duration):\n#{top}"
+    end)
   end
 
   # Drain any pending seq_trace messages from the mailbox before finalizing.
