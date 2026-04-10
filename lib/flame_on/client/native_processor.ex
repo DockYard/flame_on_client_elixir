@@ -122,7 +122,18 @@ defmodule FlameOn.Client.NativeProcessor do
 
     case :httpc.request(:get, {url_charlist, []}, http_options, options) do
       {:ok, {{_, 200, _}, _headers, body}} ->
-        :erl_tar.extract({:binary, body}, [:compressed, {:cwd, String.to_charlist(dest)}])
+        result = :erl_tar.extract({:binary, body}, [:compressed, {:cwd, String.to_charlist(dest)}])
+
+        # Erlang's load_nif always appends .so, even on macOS.
+        # Rename .dylib to .so if needed.
+        dylib_path = Path.join(dest, @nif_name <> ".dylib")
+        so_path = Path.join(dest, @nif_name <> ".so")
+
+        if File.exists?(dylib_path) and not File.exists?(so_path) do
+          File.rename(dylib_path, so_path)
+        end
+
+        result
 
       {:ok, {{_, status, _}, _headers, _body}} ->
         {:error, "HTTP #{status}"}
