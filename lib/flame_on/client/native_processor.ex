@@ -182,9 +182,7 @@ defmodule FlameOn.Client.NativeProcessor do
   """
   @spec available?() :: boolean()
   def available? do
-    # This function is replaced by the NIF when loaded.
-    # If we reach this Elixir body, the NIF is not loaded.
-    false
+    match?({:ok, _}, process_stacks(%{"test;a" => 1000}, 0.01))
   end
 
   @doc """
