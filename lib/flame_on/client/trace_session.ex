@@ -26,7 +26,7 @@ defmodule FlameOn.Client.TraceSession do
   @default_max_events 500_000
   @default_max_stacks 50_000
   @finalize_timeout_ms 10_000
-  @default_max_mailbox_depth 50_000
+  @default_max_mailbox_depth 10_000
 
   # Batch eviction: when the stacks map reaches this fraction of max_stacks,
   # evict the bottom @eviction_percent entries by duration in one pass.
@@ -107,20 +107,22 @@ defmodule FlameOn.Client.TraceSession do
     if state.event_count >= state.max_events do
       discard_trace(state)
     else
-      state = maybe_check_mailbox(state)
+      case maybe_check_mailbox(state) do
+        {:stop, _, _} = stop -> stop
+        {:ok, state} ->
+          case maybe_degrade(state) do
+            :discarded ->
+              :discarded
 
-      case maybe_degrade(state) do
-        :discarded ->
-          :discarded
-
-        state ->
-          {:noreply,
-           %{
-             state
-             | call_stack: [mfa | state.call_stack],
-               current_entry_time: microseconds(timestamp),
-               event_count: state.event_count + 1
-           }}
+            state ->
+              {:noreply,
+               %{
+                 state
+                 | call_stack: [mfa | state.call_stack],
+                   current_entry_time: microseconds(timestamp),
+                   event_count: state.event_count + 1
+               }}
+          end
       end
     end
   end
@@ -130,37 +132,37 @@ defmodule FlameOn.Client.TraceSession do
     if state.event_count >= state.max_events do
       discard_trace(state)
     else
-      case maybe_degrade(state) do
-        :discarded ->
-          :discarded
+      case maybe_check_mailbox(state) do
+        {:stop, _, _} = stop -> stop
+        {:ok, state} ->
+          case maybe_degrade(state) do
+            :discarded ->
+              :discarded
 
-        state ->
-          now = microseconds(timestamp)
+            state ->
+              now = microseconds(timestamp)
+              duration = now - state.current_entry_time
 
-          # Calculate duration of the function that just returned
-          duration = now - state.current_entry_time
+              {stacks, stack_count} =
+                if duration > 0 and state.call_stack != [] do
+                  path = build_stack_path(state.call_stack)
+                  add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, duration)
+                else
+                  {state.stacks, state.stack_count}
+                end
 
-          # Build stack path from current call stack and add to stacks
-          {stacks, stack_count} =
-            if duration > 0 and state.call_stack != [] do
-              path = build_stack_path(state.call_stack)
-              add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, duration)
-            else
-              {state.stacks, state.stack_count}
-            end
+              call_stack = pop_stack_to(state.call_stack, mfa)
 
-          # Pop the call stack back to the return target
-          call_stack = pop_stack_to(state.call_stack, mfa)
-
-          {:noreply,
-           %{
-             state
-             | call_stack: call_stack,
-               stacks: stacks,
-               stack_count: stack_count,
-               current_entry_time: now,
-               event_count: state.event_count + 1
-           }}
+              {:noreply,
+               %{
+                 state
+                 | call_stack: call_stack,
+                   stacks: stacks,
+                   stack_count: stack_count,
+                   current_entry_time: now,
+                   event_count: state.event_count + 1
+               }}
+          end
       end
     end
   end
@@ -406,16 +408,15 @@ defmodule FlameOn.Client.TraceSession do
 
       if len > state.max_mailbox_depth do
         Logger.warning(
-          "[FlameOn] Trace mailbox overflow (#{len} pending), stopping trace"
+          "[FlameOn] Trace mailbox overflow (#{len} pending), discarding trace"
         )
 
-        Trace.stop_trace(state.traced_pid)
-        state
+        discard_trace(state)
       else
-        state
+        {:ok, state}
       end
     else
-      state
+      {:ok, state}
     end
   end
 
