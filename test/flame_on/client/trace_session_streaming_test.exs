@@ -96,36 +96,125 @@ defmodule FlameOn.Client.TraceSessionStreamingTest do
       assert count == 1
     end
 
-    test "evicts smallest when at limit" do
-      stacks = %{"a" => 100, "b" => 200, "c" => 300}
-      {stacks, count} = TraceSession.add_to_stacks(stacks, 3, 3, "d", 150)
+    test "evicts smallest entries via batch eviction at trigger" do
+      # max_stacks=10, trigger at 90% = 9 entries
+      stacks = Map.new(1..9, fn i -> {"path_#{i}", i * 100} end)
+      {stacks, count} = TraceSession.add_to_stacks(stacks, 9, 10, "new", 150)
 
-      # "a" (100) was the smallest, should be evicted
-      refute Map.has_key?(stacks, "a")
-      assert Map.has_key?(stacks, "d")
-      assert stacks["d"] == 150
-      assert count == 3
+      # Smallest entries should be evicted, new entry present
+      assert Map.has_key?(stacks, "new")
+      # Largest entries survive
+      assert Map.has_key?(stacks, "path_9")
+      # Map is under max_stacks
+      assert map_size(stacks) < 10
+      assert count == map_size(stacks)
     end
 
     test "does not grow beyond max_stacks" do
-      # Build a stacks map at capacity
-      stacks = Map.new(1..10, fn i -> {"path_#{i}", i * 100} end)
+      max_stacks = 20
+      # Fill to trigger (90% of 20 = 18)
+      stacks = Map.new(1..18, fn i -> {"path_#{i}", i * 100} end)
 
-      # Add a new path - should evict smallest and maintain count
-      {new_stacks, count} = TraceSession.add_to_stacks(stacks, 10, 10, "new_path", 50)
-      assert map_size(new_stacks) == 10
-      assert count == 10
-      assert Map.has_key?(new_stacks, "new_path")
+      # Insert several more — each one past the trigger causes batch eviction
+      {stacks, count} =
+        Enum.reduce(1..5, {stacks, 18}, fn i, {s, c} ->
+          TraceSession.add_to_stacks(s, c, max_stacks, "extra_#{i}", 5000)
+        end)
+
+      assert map_size(stacks) <= max_stacks
+      assert count == map_size(stacks)
     end
 
-    test "evicts the entry with smallest duration" do
-      stacks = %{"small" => 10, "medium" => 500, "large" => 1000}
-      {stacks, _count} = TraceSession.add_to_stacks(stacks, 3, 3, "new", 200)
+    test "evicts entries with smallest duration, keeps largest" do
+      # max_stacks=20, trigger at 18
+      stacks = Map.new(1..18, fn i -> {"path_#{i}", i * 10} end)
+      # path_1=10, path_2=20, ..., path_18=180
 
-      refute Map.has_key?(stacks, "small")
-      assert Map.has_key?(stacks, "medium")
-      assert Map.has_key?(stacks, "large")
+      {stacks, _count} = TraceSession.add_to_stacks(stacks, 18, 20, "new", 200)
+
+      # Smallest entries evicted
+      refute Map.has_key?(stacks, "path_1")
+      # Largest entries survive
+      assert Map.has_key?(stacks, "path_18")
+      assert Map.has_key?(stacks, "path_17")
+      # New entry present
       assert Map.has_key?(stacks, "new")
+    end
+
+    test "batch evicts bottom entries when at eviction trigger" do
+      # With max_stacks=100, eviction trigger at 90% = 90 entries.
+      # Build a map with 90 entries (at the trigger point).
+      max_stacks = 100
+      stacks = Map.new(1..90, fn i -> {"path_#{i}", i} end)
+
+      # Insert one more — should trigger batch eviction.
+      # After eviction: ~90 entries (bottom 10% removed) + 1 new = ~81
+      {new_stacks, new_count} = TraceSession.add_to_stacks(stacks, 90, max_stacks, "new_path", 500)
+
+      # Map should be well under max_stacks after batch eviction
+      assert map_size(new_stacks) < max_stacks
+      # The new path should be present
+      assert Map.has_key?(new_stacks, "new_path")
+      # The smallest entries (path_1 through ~path_10) should have been evicted
+      refute Map.has_key?(new_stacks, "path_1")
+      refute Map.has_key?(new_stacks, "path_2")
+      # Larger entries should survive
+      assert Map.has_key?(new_stacks, "path_90")
+      assert Map.has_key?(new_stacks, "path_80")
+      # Count should match map size
+      assert new_count == map_size(new_stacks)
+    end
+
+    test "many inserts after batch eviction are O(1) until next trigger" do
+      max_stacks = 100
+      stacks = Map.new(1..90, fn i -> {"path_#{i}", i * 100} end)
+
+      # Trigger batch eviction with first insert past the trigger
+      {stacks, count} = TraceSession.add_to_stacks(stacks, 90, max_stacks, "trigger", 500)
+
+      # Now insert several more — these should all be fast O(1) inserts
+      # because we're below the trigger again after batch eviction
+      {stacks, count} = TraceSession.add_to_stacks(stacks, count, max_stacks, "fast_1", 600)
+      {stacks, count} = TraceSession.add_to_stacks(stacks, count, max_stacks, "fast_2", 700)
+      {stacks, count} = TraceSession.add_to_stacks(stacks, count, max_stacks, "fast_3", 800)
+
+      assert Map.has_key?(stacks, "trigger")
+      assert Map.has_key?(stacks, "fast_1")
+      assert Map.has_key?(stacks, "fast_2")
+      assert Map.has_key?(stacks, "fast_3")
+      assert count == map_size(stacks)
+      # Still well under max
+      assert map_size(stacks) < max_stacks
+    end
+
+    test "batch eviction preserves highest-duration entries" do
+      max_stacks = 20
+      # 18 entries = 90% of 20, at the trigger
+      stacks = Map.new(1..18, fn i -> {"path_#{i}", i * 10} end)
+      # path_1=10, path_2=20, ..., path_18=180
+
+      {new_stacks, _count} = TraceSession.add_to_stacks(stacks, 18, max_stacks, "new", 500)
+
+      # Bottom 10% of 20 = 2 entries should be evicted (path_1=10, path_2=20)
+      refute Map.has_key?(new_stacks, "path_1")
+      refute Map.has_key?(new_stacks, "path_2")
+      # Top entries must survive
+      assert Map.has_key?(new_stacks, "path_18")
+      assert Map.has_key?(new_stacks, "path_17")
+      assert Map.has_key?(new_stacks, "path_16")
+      # New entry survives
+      assert Map.has_key?(new_stacks, "new")
+    end
+
+    test "existing path accumulation is always O(1) regardless of map size" do
+      max_stacks = 10
+      stacks = Map.new(1..10, fn i -> {"path_#{i}", i * 100} end)
+
+      # Updating an existing path should never trigger eviction
+      {stacks, count} = TraceSession.add_to_stacks(stacks, 10, max_stacks, "path_5", 999)
+      assert stacks["path_5"] == 1499
+      assert count == 10
+      assert map_size(stacks) == 10
     end
   end
 

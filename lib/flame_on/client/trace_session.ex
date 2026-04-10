@@ -28,6 +28,12 @@ defmodule FlameOn.Client.TraceSession do
   @finalize_timeout_ms 10_000
   @default_max_mailbox_depth 50_000
 
+  # Batch eviction: when the stacks map reaches this fraction of max_stacks,
+  # evict the bottom @eviction_percent entries by duration in one pass.
+  # This amortizes the O(N) scan cost over N * eviction_percent inserts.
+  @eviction_trigger 0.9
+  @eviction_percent 0.1
+
   # Adaptive degradation thresholds
   @reduced_threshold 100_000
   @minimal_threshold 300_000
@@ -332,18 +338,44 @@ defmodule FlameOn.Client.TraceSession do
   def add_to_stacks(stacks, stack_count, max_stacks, path, duration) do
     case Map.fetch(stacks, path) do
       {:ok, existing} ->
-        # Path already exists -- just add duration. No growth.
+        # Path already exists — just add duration. O(1), no growth.
         {Map.put(stacks, path, existing + duration), stack_count}
 
-      :error when stack_count < max_stacks ->
-        # New path, under limit -- add it.
+      :error when stack_count < trunc(max_stacks * @eviction_trigger) ->
+        # New path, below eviction trigger — add it. O(1).
         {Map.put(stacks, path, duration), stack_count + 1}
 
       :error ->
-        # New path, at limit -- evict the smallest entry and add.
-        {min_path, _min_dur} = Enum.min_by(stacks, fn {_k, v} -> v end)
-        stacks = stacks |> Map.delete(min_path) |> Map.put(path, duration)
-        {stacks, stack_count}
+        # At or above eviction trigger — batch evict the bottom entries,
+        # then add the new path. One O(N) scan amortized over many inserts.
+        stacks = batch_evict(stacks, max_stacks)
+        {Map.put(stacks, path, duration), map_size(stacks) + 1}
+    end
+  end
+
+  defp batch_evict(stacks, max_stacks) do
+    # After eviction, the map should be at (1 - eviction_percent) of the trigger.
+    # This leaves headroom for new inserts before the next eviction cycle.
+    eviction_trigger_size = trunc(max_stacks * @eviction_trigger)
+    target_size = trunc(eviction_trigger_size * (1.0 - @eviction_percent))
+    count_to_evict = map_size(stacks) - target_size
+
+    if count_to_evict <= 0 do
+      stacks
+    else
+      durations = stacks |> Map.values() |> Enum.sort()
+      threshold = Enum.at(durations, count_to_evict - 1, 0)
+
+      {evicted_stacks, _} =
+        Enum.reduce(stacks, {stacks, 0}, fn {path, dur}, {acc, evicted} ->
+          if evicted < count_to_evict and dur <= threshold do
+            {Map.delete(acc, path), evicted + 1}
+          else
+            {acc, evicted}
+          end
+        end)
+
+      evicted_stacks
     end
   end
 
