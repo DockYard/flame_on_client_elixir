@@ -56,8 +56,8 @@ defmodule FlameOn.Client.NativeProcessor do
   end
 
   defp nif_so_path do
-    ext = if os() == "macos", do: ".dylib", else: ".so"
-    nif_path() <> ext
+    # Erlang's load_nif always appends .so, even on macOS
+    nif_path() <> ".so"
   end
 
   defp build_priv_dir do
