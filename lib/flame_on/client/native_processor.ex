@@ -1,62 +1,179 @@
 defmodule FlameOn.Client.NativeProcessor do
   @moduledoc """
-  NIF bridge to the Zig-based flame graph processor.
-
-  Replaces ProfileFilter + PprofEncoder with a single native call
-  that runs on a dirty CPU scheduler. On any error or when the NIF
-  is unavailable, callers should fall back to the Elixir implementation.
-
-  ## Architecture
-
-  The NIF receives the collapsed stacks map (`%{binary => integer}`)
-  and a threshold float, processes them in Zig-managed memory (outside
-  the BEAM heap), and returns a serialized pprof Profile protobuf binary.
-
-  The NIF runs on a dirty CPU scheduler because profile processing
-  can take 10-100ms for large traces.
-
-  ## Usage
-
-      case NativeProcessor.process_stacks(stacks, threshold) do
-        {:ok, profile_binary} -> profile_binary
-        {:error, _reason} -> elixir_fallback(stacks, threshold)
-      end
-
-  ## Availability
-
-  The NIF is optional. When the Zig processor library is not compiled
-  (e.g., during development or on platforms without Zig), `available?/0`
-  returns false and `process_stacks/2` returns `{:error, :nif_not_loaded}`.
+  Downloads and loads the precompiled Zig NIF for native profile processing.
+  Falls back to Elixir ProfileFilter + PprofEncoder when the NIF is unavailable.
   """
 
   require Logger
+
+  @version Mix.Project.config()[:version]
+  @github_repo "DockYard/flame_on_processor"
+  @nif_name "libflame_on_processor_nif"
+
+  # Platform detection
+
+  @doc """
+  Returns the target triple string for the current platform (e.g. "aarch64-macos").
+  """
+  def target do
+    "#{arch()}-#{os()}"
+  end
+
+  defp arch do
+    arch_str = :erlang.system_info(:system_architecture) |> List.to_string()
+
+    cond do
+      String.starts_with?(arch_str, "aarch64") -> "aarch64"
+      String.starts_with?(arch_str, "arm") -> "aarch64"
+      String.contains?(arch_str, "x86_64") -> "x86_64"
+      String.contains?(arch_str, "amd64") -> "x86_64"
+      true -> "unknown"
+    end
+  end
+
+  defp os do
+    case :os.type() do
+      {:unix, :linux} -> "linux"
+      {:unix, :darwin} -> "macos"
+      _ -> "unknown"
+    end
+  end
+
+  # NIF path resolution
+
+  @doc """
+  Returns the path to the NIF shared library (without extension).
+  Used by `:erlang.load_nif/2`.
+  """
+  def nif_path do
+    priv =
+      case :code.priv_dir(:flame_on_client) do
+        {:error, _} -> build_priv_dir()
+        path -> List.to_string(path)
+      end
+
+    Path.join([priv, "native", @nif_name])
+  end
+
+  defp nif_so_path do
+    ext = if os() == "macos", do: ".dylib", else: ".so"
+    nif_path() <> ext
+  end
+
+  defp build_priv_dir do
+    Path.join([Mix.Project.build_path(), "lib", "flame_on_client", "priv"])
+  end
+
+  defp native_dir do
+    Path.join(build_priv_dir(), "native")
+  end
+
+  # Download URL
+
+  defp download_url(target_triple) do
+    "https://github.com/#{@github_repo}/releases/download/v#{@version}/flame_on_processor-nif-#{target_triple}.tar.gz"
+  end
+
+  @doc """
+  Ensures the precompiled NIF binary is available on disk.
+  Downloads it from GitHub releases if not already cached.
+  Returns `true` if the NIF file exists, `false` otherwise.
+  """
+  def ensure_precompiled do
+    if File.exists?(nif_so_path()) do
+      true
+    else
+      case download_precompiled() do
+        :ok ->
+          true
+
+        {:error, reason} ->
+          Logger.info(
+            "[FlameOn] Precompiled NIF not available (#{reason}), using Elixir fallback"
+          )
+
+          false
+      end
+    end
+  end
+
+  defp download_precompiled do
+    target = target()
+
+    if target =~ "unknown" do
+      {:error, "unsupported platform: #{target}"}
+    else
+      url = download_url(target)
+      dest = native_dir()
+      File.mkdir_p!(dest)
+      download_and_extract(url, dest)
+    end
+  end
+
+  defp download_and_extract(url, dest) do
+    {:ok, _} = Application.ensure_all_started(:inets)
+    {:ok, _} = Application.ensure_all_started(:ssl)
+
+    url_charlist = String.to_charlist(url)
+    http_options = [ssl: ssl_opts()]
+    options = [body_format: :binary]
+
+    Logger.info("[FlameOn] Downloading precompiled NIF from #{url}")
+
+    case :httpc.request(:get, {url_charlist, []}, http_options, options) do
+      {:ok, {{_, 200, _}, _headers, body}} ->
+        :erl_tar.extract({:binary, body}, [:compressed, {:cwd, String.to_charlist(dest)}])
+
+      {:ok, {{_, status, _}, _headers, _body}} ->
+        {:error, "HTTP #{status}"}
+
+      {:error, reason} ->
+        {:error, inspect(reason)}
+    end
+  end
+
+  defp ssl_opts do
+    # OTP 25+
+    certs = :public_key.cacerts_get()
+
+    [
+      verify: :verify_peer,
+      cacerts: certs,
+      depth: 3,
+      customize_hostname_check: [
+        match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+      ]
+    ]
+  rescue
+    _ -> []
+  end
+
+  # NIF loading
 
   @on_load :load_nif
 
   @doc false
   def load_nif do
-    path =
-      :flame_on_client
-      |> :code.priv_dir()
-      |> Path.join("native/native_processor")
+    if ensure_precompiled() do
+      path = nif_path() |> String.to_charlist()
 
-    case :erlang.load_nif(String.to_charlist(path), 0) do
-      :ok ->
-        :ok
+      case :erlang.load_nif(path, 0) do
+        :ok ->
+          :ok
 
-      {:error, {:load_failed, _}} ->
-        Logger.debug("[FlameOn] Native processor NIF not available, using Elixir fallback")
-        :ok
+        {:error, {:reload, _}} ->
+          :ok
 
-      {:error, {:reload, _}} ->
-        :ok
+        {:error, reason} ->
+          Logger.info(
+            "[FlameOn] NIF load failed: #{inspect(reason)}, using Elixir fallback"
+          )
 
-      {:error, reason} ->
-        Logger.debug(
-          "[FlameOn] Native processor NIF load failed: #{inspect(reason)}, using Elixir fallback"
-        )
-
-        :ok
+          # Don't crash the module — fall back to Elixir implementation
+          :ok
+      end
+    else
+      :ok
     end
   end
 

@@ -14,7 +14,7 @@ defmodule FlameOnClient.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, inets: :optional, ssl: :optional],
       mod: {FlameOn.Client.Application, []}
     ]
   end

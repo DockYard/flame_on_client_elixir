@@ -66,7 +66,7 @@ defmodule FlameOn.Client.Shipper do
   defp flush(state) do
     batch = :queue.to_list(state.buffer)
     adapter = state.config.shipper_adapter
-    payload_bytes = batch |> Jason.encode!() |> byte_size()
+    payload_bytes = batch |> :erlang.term_to_binary() |> byte_size()
 
     Logger.info(
       "[FlameOn] Shipping #{length(batch)} trace(s), payload size: #{format_bytes(payload_bytes)}"

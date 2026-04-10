@@ -67,6 +67,14 @@ defmodule FlameOn.Client.Shipper.Grpc do
       event_identifier: trace.event_identifier,
       profile: profile
     }
+  rescue
+    e ->
+      Logger.warning(
+        "[FlameOn] Failed to decode NIF protobuf binary: #{inspect(e)}, " <>
+          "falling back to Elixir encoder"
+      )
+
+      encode_trace(Map.delete(trace, :profile_binary))
   end
 
   defp encode_trace(trace) do

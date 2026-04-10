@@ -129,6 +129,28 @@ defmodule FlameOn.Client.ShipperTest do
       assert log =~ "trace(s)"
       assert log =~ ~r/\d+(\.\d+)?\s*(B|KB|MB)/
     end
+
+    test "does not crash when payload contains raw binary data" do
+      FlameOn.Client.Shipper.MockAdapter
+      |> expect(:send_batch, fn _batch, _config -> :ok end)
+
+      pid = start_shipper(flush_interval_ms: 50)
+
+      # Simulate NIF output: profile_binary contains raw protobuf bytes
+      # that cannot be JSON-encoded
+      log =
+        capture_log(fn ->
+          Shipper.push(pid, %{
+            trace_id: "1",
+            profile_binary: <<10, 0, 18, 5, 104, 101, 108, 108, 111>>
+          })
+
+          Process.sleep(100)
+        end)
+
+      assert log =~ "[FlameOn] Shipping"
+      assert log =~ "trace(s)"
+    end
   end
 
   describe "gun messages" do
