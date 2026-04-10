@@ -1,12 +1,19 @@
 defmodule FlameOn.Client.TraceSession do
+  @moduledoc """
+  Captures erlang:trace messages and builds streaming collapsed stacks.
+
+  Phase 3 architecture: instead of building a Block tree in memory and
+  converting it to collapsed stacks after the trace ends, this module
+  builds collapsed stacks incrementally during capture. Memory usage is
+  O(P) where P = number of unique stack paths (typically 1K-10K),
+  independent of trace event count.
+  """
+
   use GenServer, restart: :temporary
 
   require Logger
 
-  alias FlameOn.Client.Capture.Block
-  alias FlameOn.Client.Capture.Stack
   alias FlameOn.Client.Capture.Trace
-  alias FlameOn.Client.CollapsedStacks
   alias FlameOn.Client.ProfileFilter
   alias FlameOn.Client.SeqTraceRouter
   alias FlameOn.Client.Shipper
@@ -16,7 +23,14 @@ defmodule FlameOn.Client.TraceSession do
   end
 
   @default_max_events 500_000
+  @default_max_stacks 50_000
   @finalize_timeout_ms 10_000
+  @default_max_mailbox_depth 50_000
+
+  # Adaptive degradation thresholds
+  @reduced_threshold 100_000
+  @minimal_threshold 300_000
+  @drop_threshold 500_000
 
   @impl true
   def init(opts) do
@@ -25,8 +39,17 @@ defmodule FlameOn.Client.TraceSession do
     shipper_pid = Keyword.fetch!(opts, :shipper_pid)
     function_length_threshold = Keyword.fetch!(opts, :function_length_threshold)
     max_events = Keyword.get(opts, :max_events, @default_max_events)
+    max_stacks = Keyword.get(opts, :max_stacks, @default_max_stacks)
+    adaptive_degradation = Keyword.get(opts, :adaptive_degradation, true)
     seq_trace_label = Keyword.get(opts, :seq_trace_label)
     seq_trace_router = Keyword.get(opts, :seq_trace_router)
+
+    max_mailbox_depth =
+      Keyword.get(
+        opts,
+        :max_mailbox_depth,
+        Application.get_env(:flame_on_client, :max_mailbox_depth, @default_max_mailbox_depth)
+      )
 
     case Trace.start_trace(traced_pid, self()) do
       :ok ->
@@ -37,12 +60,7 @@ defmodule FlameOn.Client.TraceSession do
         Process.monitor(traced_pid)
         now = System.system_time(:microsecond)
 
-        root_block = %Block{
-          id: :erlang.unique_integer([:positive, :monotonic]),
-          function: {:root, trace_info.event_name, trace_info.event_identifier},
-          absolute_start: now,
-          level: 0
-        }
+        root_mfa = {:root, trace_info.event_name, trace_info.event_identifier}
 
         {:ok,
          %{
@@ -51,8 +69,20 @@ defmodule FlameOn.Client.TraceSession do
            shipper_pid: shipper_pid,
            function_length_threshold: function_length_threshold,
            max_events: max_events,
+           max_stacks: max_stacks,
+           max_mailbox_depth: max_mailbox_depth,
+           adaptive_degradation: adaptive_degradation,
            event_count: 0,
-           stack: [root_block],
+
+           # Streaming collapsed stacks state
+           call_stack: [root_mfa],
+           stacks: %{},
+           stack_count: 0,
+           current_entry_time: now,
+           trace_start: now,
+           scheduled_out_at: nil,
+
+           # Cross-process tracking
            seq_trace_label: seq_trace_label,
            seq_trace_router: seq_trace_router,
            pending_calls: %{},
@@ -64,40 +94,71 @@ defmodule FlameOn.Client.TraceSession do
     end
   end
 
-  # Trace messages — call
+  # Trace messages -- call
   @impl true
   def handle_info({:trace_ts, _pid, :call, mfa, timestamp}, state) do
     if state.event_count >= state.max_events do
       discard_trace(state)
     else
-      {:noreply,
-       %{
-         state
-         | stack: Stack.handle_trace_call(state.stack, mfa, microseconds(timestamp)),
-           event_count: state.event_count + 1
-       }}
-    end
-  end
+      state = maybe_check_mailbox(state)
 
-  # Trace messages — return_to
-  def handle_info({:trace_ts, _pid, :return_to, mfa, timestamp}, state) do
-    if state.event_count >= state.max_events do
-      discard_trace(state)
-    else
-      if state.stack != [] and length(state.stack) >= 2 do
-        {:noreply,
-         %{
-           state
-           | stack: Stack.handle_trace_return_to(state.stack, mfa, microseconds(timestamp)),
-             event_count: state.event_count + 1
-         }}
-      else
-        {:noreply, %{state | event_count: state.event_count + 1}}
+      case maybe_degrade(state) do
+        :discarded ->
+          :discarded
+
+        state ->
+          {:noreply,
+           %{
+             state
+             | call_stack: [mfa | state.call_stack],
+               current_entry_time: microseconds(timestamp),
+               event_count: state.event_count + 1
+           }}
       end
     end
   end
 
-  # Trace messages — process scheduled out (sleep)
+  # Trace messages -- return_to
+  def handle_info({:trace_ts, _pid, :return_to, mfa, timestamp}, state) do
+    if state.event_count >= state.max_events do
+      discard_trace(state)
+    else
+      case maybe_degrade(state) do
+        :discarded ->
+          :discarded
+
+        state ->
+          now = microseconds(timestamp)
+
+          # Calculate duration of the function that just returned
+          duration = now - state.current_entry_time
+
+          # Build stack path from current call stack and add to stacks
+          {stacks, stack_count} =
+            if duration > 0 and state.call_stack != [] do
+              path = build_stack_path(state.call_stack)
+              add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, duration)
+            else
+              {state.stacks, state.stack_count}
+            end
+
+          # Pop the call stack back to the return target
+          call_stack = pop_stack_to(state.call_stack, mfa)
+
+          {:noreply,
+           %{
+             state
+             | call_stack: call_stack,
+               stacks: stacks,
+               stack_count: stack_count,
+               current_entry_time: now,
+               event_count: state.event_count + 1
+           }}
+      end
+    end
+  end
+
+  # Trace messages -- process scheduled out (sleep)
   def handle_info({:trace_ts, _pid, :out, _mfa, timestamp}, state) do
     if state.event_count >= state.max_events do
       discard_trace(state)
@@ -105,28 +166,34 @@ defmodule FlameOn.Client.TraceSession do
       {:noreply,
        %{
          state
-         | stack: Stack.handle_trace_call(state.stack, :sleep, microseconds(timestamp)),
+         | scheduled_out_at: microseconds(timestamp),
            event_count: state.event_count + 1
        }}
     end
   end
 
-  # Trace messages — process scheduled in (wake from sleep)
+  # Trace messages -- process scheduled in (wake from sleep)
   def handle_info({:trace_ts, _pid, :in, _mfa, timestamp}, state) do
     if state.event_count >= state.max_events do
       discard_trace(state)
     else
-      case state.stack do
-        [%Block{function: :sleep} | _] ->
-          {:noreply,
-           %{
-             state
-             | stack: Stack.handle_trace_return_to(state.stack, :sleep, microseconds(timestamp)),
-               event_count: state.event_count + 1
-           }}
+      if state.scheduled_out_at do
+        sleep_duration = microseconds(timestamp) - state.scheduled_out_at
+        path = build_stack_path([:sleep | state.call_stack])
 
-        _ ->
-          {:noreply, %{state | event_count: state.event_count + 1}}
+        {stacks, stack_count} =
+          add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, sleep_duration)
+
+        {:noreply,
+         %{
+           state
+           | stacks: stacks,
+             stack_count: stack_count,
+             scheduled_out_at: nil,
+             event_count: state.event_count + 1
+         }}
+      else
+        {:noreply, %{state | event_count: state.event_count + 1}}
       end
     end
   end
@@ -143,7 +210,7 @@ defmodule FlameOn.Client.TraceSession do
     {:stop, :normal, state}
   end
 
-  # seq_trace — target process receives $gen_call from traced process.
+  # seq_trace -- target process receives $gen_call from traced process.
   # When erlang tracing is active on the traced process, the :send event from
   # the traced process is consumed by the erlang tracer. We use the target's
   # :receive event instead, which contains the same $gen_call payload.
@@ -162,13 +229,14 @@ defmodule FlameOn.Client.TraceSession do
         target_pid: to_pid,
         target_name: process_name(to_pid),
         message_form: sanitize_message(msg),
-        send_timestamp: microseconds(timestamp)
+        send_timestamp: microseconds(timestamp),
+        call_stack_at_send: state.call_stack
       })
 
     {:noreply, %{state | pending_calls: pending_calls}}
   end
 
-  # seq_trace — target process sends reply back to traced process.
+  # seq_trace -- target process sends reply back to traced process.
   # The :send event from the target has the reference alias as `to` (not the PID).
   # We match on the reference to correlate with the pending $gen_call.
   def handle_info(
@@ -184,24 +252,27 @@ defmodule FlameOn.Client.TraceSession do
       {pending, remaining} ->
         reply_timestamp = microseconds(timestamp)
 
-        completed = %{
-          target_pid: pending.target_pid,
-          target_name: pending.target_name,
-          message_form: pending.message_form,
-          start_timestamp: pending.send_timestamp,
-          end_timestamp: reply_timestamp
-        }
+        # Inject the cross-process call into the stacks map
+        call_duration = reply_timestamp - pending.send_timestamp
+        call_mfa = {:cross_process_call, pending.target_pid, pending.target_name, pending.message_form}
+        call_stack_with_call = [call_mfa, :sleep | pending.call_stack_at_send]
+        path = build_stack_path(call_stack_with_call)
+
+        {stacks, stack_count} =
+          add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, call_duration)
 
         {:noreply,
          %{
            state
            | pending_calls: remaining,
-             completed_calls: [completed | state.completed_calls]
+             completed_calls: [pending | state.completed_calls],
+             stacks: stacks,
+             stack_count: stack_count
          }}
     end
   end
 
-  # seq_trace — ignore other seq_trace messages
+  # seq_trace -- ignore other seq_trace messages
   def handle_info({:seq_trace, _label, _info, _timestamp}, state) do
     {:noreply, state}
   end
@@ -228,6 +299,135 @@ defmodule FlameOn.Client.TraceSession do
     {:stop, :normal, state}
   end
 
+  # -- Public helper functions (for testing) --
+
+  @doc false
+  def build_stack_path(call_stack) do
+    call_stack
+    |> Enum.reverse()
+    |> Enum.map(&format_mfa/1)
+    |> Enum.join(";")
+  end
+
+  @doc false
+  def format_mfa(:sleep), do: "SLEEP"
+  def format_mfa({:root, name, id}), do: "#{name} #{id}"
+
+  def format_mfa({:cross_process_call, _pid, name, msg}) do
+    "CALL #{format_process_name(name)} #{format_message_form(msg)}"
+  end
+
+  def format_mfa({:cross_process_call, _pid, name}) do
+    "CALL #{format_process_name(name)}"
+  end
+
+  def format_mfa({m, f, a}) when is_atom(m) and is_atom(f) and is_integer(a) do
+    "#{m}.#{f}/#{a}"
+  end
+
+  def format_mfa(other), do: inspect(other)
+
+  @doc false
+  def add_to_stacks(stacks, stack_count, max_stacks, path, duration) do
+    case Map.fetch(stacks, path) do
+      {:ok, existing} ->
+        # Path already exists -- just add duration. No growth.
+        {Map.put(stacks, path, existing + duration), stack_count}
+
+      :error when stack_count < max_stacks ->
+        # New path, under limit -- add it.
+        {Map.put(stacks, path, duration), stack_count + 1}
+
+      :error ->
+        # New path, at limit -- evict the smallest entry and add.
+        {min_path, _min_dur} = Enum.min_by(stacks, fn {_k, v} -> v end)
+        stacks = stacks |> Map.delete(min_path) |> Map.put(path, duration)
+        {stacks, stack_count}
+    end
+  end
+
+  @doc false
+  def pop_stack_to(stack, mfa) do
+    do_pop_stack_to(stack, mfa, 0)
+  end
+
+  # Found the target -- return the stack from this point
+  defp do_pop_stack_to([top | _rest] = stack, mfa, _depth) when top == mfa, do: stack
+
+  # Don't pop the last element (root frame) -- preserve it
+  defp do_pop_stack_to([last], _mfa, _depth), do: [last]
+
+  # Empty stack -- nothing to pop
+  defp do_pop_stack_to([], _mfa, _depth), do: []
+
+  # Pop one frame and keep looking
+  defp do_pop_stack_to([_top | rest], mfa, depth) do
+    do_pop_stack_to(rest, mfa, depth + 1)
+  end
+
+  # -- Private functions --
+
+  defp maybe_check_mailbox(state) do
+    if rem(state.event_count, 1000) == 0 and state.event_count > 0 do
+      {:message_queue_len, len} = Process.info(self(), :message_queue_len)
+
+      if len > state.max_mailbox_depth do
+        Logger.warning(
+          "[FlameOn] Trace mailbox overflow (#{len} pending), stopping trace"
+        )
+
+        Trace.stop_trace(state.traced_pid)
+        state
+      else
+        state
+      end
+    else
+      state
+    end
+  end
+
+  defp maybe_degrade(%{adaptive_degradation: false} = state), do: state
+
+  defp maybe_degrade(state) do
+    cond do
+      state.event_count == @drop_threshold ->
+        Trace.stop_trace(state.traced_pid)
+        trace = state.trace_info
+
+        Logger.warning(
+          "[FlameOn] Trace discarded at #{@drop_threshold} events " <>
+            "for #{trace.event_name} #{trace.event_identifier}"
+        )
+
+        :discarded
+
+      state.event_count == @minimal_threshold ->
+        # Minimal: stop capturing returns (duration tracking disabled)
+        try do
+          :erlang.trace(state.traced_pid, false, [:return_to])
+        rescue
+          ArgumentError -> :ok
+        end
+
+        Logger.debug("[FlameOn] Trace degraded to minimal fidelity at #{@minimal_threshold} events")
+        state
+
+      state.event_count == @reduced_threshold ->
+        # Reduce: stop capturing scheduling events
+        try do
+          :erlang.trace(state.traced_pid, false, [:running])
+        rescue
+          ArgumentError -> :ok
+        end
+
+        Logger.debug("[FlameOn] Trace degraded to reduced fidelity at #{@reduced_threshold} events")
+        state
+
+      true ->
+        state
+    end
+  end
+
   defp discard_trace(state) do
     Trace.stop_trace(state.traced_pid)
     trace = state.trace_info
@@ -241,89 +441,98 @@ defmodule FlameOn.Client.TraceSession do
   end
 
   defp finalize_and_ship(state) do
-    task =
-      Task.async(fn ->
-        do_finalize_and_ship(state)
-      end)
+    # Try to use FinalizationGate if available (Phase 2), otherwise proceed directly
+    gate_available? = finalization_gate_available?()
 
-    case Task.yield(task, @finalize_timeout_ms) || Task.shutdown(task) do
-      {:ok, _result} ->
+    gate_result =
+      if gate_available? do
+        FlameOn.Client.FinalizationGate.acquire()
+      else
         :ok
+      end
 
-      nil ->
-        trace = state.trace_info
+    case gate_result do
+      :ok ->
+        try do
+          task =
+            Task.async(fn ->
+              do_finalize_and_ship(state)
+            end)
 
-        Logger.warning(
-          "[FlameOn] Trace finalization timed out, discarding " <>
-            "for #{trace.event_name} #{trace.event_identifier}"
-        )
+          case Task.yield(task, @finalize_timeout_ms) || Task.shutdown(task) do
+            {:ok, _result} ->
+              :ok
 
+            nil ->
+              trace = state.trace_info
+
+              Logger.warning(
+                "[FlameOn] Trace finalization timed out, discarding " <>
+                  "for #{trace.event_name} #{trace.event_identifier}"
+              )
+
+              :ok
+          end
+        after
+          if gate_available? do
+            FlameOn.Client.FinalizationGate.release()
+          end
+        end
+
+      :full ->
+        Logger.warning("[FlameOn] Finalization gate full, discarding trace")
         :ok
+    end
+  end
+
+  defp finalization_gate_available? do
+    try do
+      :persistent_term.get(:flame_on_finalization_count)
+      true
+    rescue
+      ArgumentError -> false
     end
   end
 
   defp do_finalize_and_ship(state) do
     trace = state.trace_info
+    stacks = state.stacks
 
-    if state.stack != [] do
-      [root_block] = Stack.finalize_stack(state.stack)
-      root_block = inject_completed_calls(root_block, state.completed_calls)
-      duration_us = root_block.duration
+    total_duration = Enum.sum(Map.values(stacks))
 
-      Logger.debug(fn ->
-        "[FlameOn] Finalized trace #{trace.event_name} #{trace.event_identifier}\n" <>
-          "  root: #{inspect(root_block.function)}\n" <>
-          "  duration_us: #{duration_us}\n" <>
-          "  threshold_us: #{trace.threshold_us}\n" <>
-          "  children: #{length(root_block.children)}\n" <>
-          format_block_tree(root_block, "  ")
-      end)
-
-      if duration_us >= trace.threshold_us do
-        collapsed = CollapsedStacks.convert(root_block)
-
-        Logger.debug(fn ->
-          top =
-            collapsed
-            |> Enum.sort_by(& &1.duration_us, :desc)
-            |> Enum.take(20)
-            |> Enum.map(fn s -> "  #{s.duration_us}us  #{s.stack_path}" end)
-            |> Enum.join("\n")
-
-          "[FlameOn] Collapsed stacks (top 20 by duration):\n#{top}"
+    if total_duration >= trace.threshold_us and map_size(stacks) > 0 do
+      # Convert map to sample list (already in collapsed stacks format)
+      samples =
+        Enum.map(stacks, fn {path, duration} ->
+          %{stack_path: path, duration_us: duration}
         end)
 
-        filtered =
-          ProfileFilter.filter(collapsed,
-            function_length_threshold: state.function_length_threshold
-          )
+      Logger.debug(fn ->
+        top =
+          samples
+          |> Enum.sort_by(& &1.duration_us, :desc)
+          |> Enum.take(20)
+          |> Enum.map(fn s -> "  #{s.duration_us}us  #{s.stack_path}" end)
+          |> Enum.join("\n")
 
-        Shipper.push(state.shipper_pid, %{
-          trace_id: trace.trace_id,
-          event_name: trace.event_name,
-          event_identifier: trace.event_identifier,
-          duration_us: duration_us,
-          captured_at: Map.get(trace, :started_at, System.system_time(:microsecond)),
-          samples: filtered
-        })
-      end
+        "[FlameOn] Collapsed stacks (top 20 by duration):\n#{top}"
+      end)
+
+      # ProfileFilter still works -- but now operates on 1K-10K samples, not 100K-1M
+      filtered =
+        ProfileFilter.filter(samples,
+          function_length_threshold: state.function_length_threshold
+        )
+
+      Shipper.push(state.shipper_pid, %{
+        trace_id: trace.trace_id,
+        event_name: trace.event_name,
+        event_identifier: trace.event_identifier,
+        duration_us: total_duration,
+        captured_at: Map.get(trace, :started_at, System.system_time(:microsecond)),
+        samples: filtered
+      })
     end
-  end
-
-  defp format_block_tree(%Block{function: func, duration: dur, children: children}, indent) do
-    label = CollapsedStacks.format_function(func)
-    line = "#{indent}#{label} (#{dur}us)\n"
-
-    child_lines =
-      children
-      |> Enum.take(20)
-      |> Enum.map(&format_block_tree(&1, indent <> "  "))
-      |> Enum.join()
-
-    suffix =
-      if length(children) > 20, do: "#{indent}  ... #{length(children) - 20} more\n", else: ""
-
-    line <> child_lines <> suffix
   end
 
   # Drain any pending seq_trace messages from the mailbox before finalizing.
@@ -353,7 +562,8 @@ defmodule FlameOn.Client.TraceSession do
             target_pid: to_pid,
             target_name: process_name(to_pid),
             message_form: sanitize_message(msg),
-            send_timestamp: microseconds(timestamp)
+            send_timestamp: microseconds(timestamp),
+            call_stack_at_send: state.call_stack
           })
 
         do_drain_seq_trace_messages(%{state | pending_calls: pending_calls})
@@ -366,18 +576,21 @@ defmodule FlameOn.Client.TraceSession do
             do_drain_seq_trace_messages(state)
 
           {pending, remaining} ->
-            completed = %{
-              target_pid: pending.target_pid,
-              target_name: pending.target_name,
-              message_form: pending.message_form,
-              start_timestamp: pending.send_timestamp,
-              end_timestamp: microseconds(timestamp)
-            }
+            reply_timestamp = microseconds(timestamp)
+            call_duration = reply_timestamp - pending.send_timestamp
+            call_mfa = {:cross_process_call, pending.target_pid, pending.target_name, pending.message_form}
+            call_stack_with_call = [call_mfa, :sleep | pending.call_stack_at_send]
+            path = build_stack_path(call_stack_with_call)
+
+            {stacks, stack_count} =
+              add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, call_duration)
 
             do_drain_seq_trace_messages(%{
               state
               | pending_calls: remaining,
-                completed_calls: [completed | state.completed_calls]
+                completed_calls: [pending | state.completed_calls],
+                stacks: stacks,
+                stack_count: stack_count
             })
         end
 
@@ -386,50 +599,6 @@ defmodule FlameOn.Client.TraceSession do
     after
       0 -> state
     end
-  end
-
-  # Post-process the finalized block tree to inject cross-process call blocks
-  # as children of matching sleep blocks. A completed call matches a sleep block
-  # when the call's time range falls within the sleep's time range.
-  defp inject_completed_calls(block, []), do: block
-
-  defp inject_completed_calls(%Block{} = block, completed_calls) do
-    children = Enum.map(block.children, &inject_completed_calls(&1, completed_calls))
-
-    children =
-      Enum.map(children, fn
-        %Block{function: :sleep} = sleep_block ->
-          matching_calls =
-            Enum.filter(completed_calls, fn call ->
-              call.start_timestamp >= sleep_block.absolute_start and
-                call.end_timestamp <=
-                  sleep_block.absolute_start + sleep_block.duration
-            end)
-
-          if matching_calls == [] do
-            sleep_block
-          else
-            call_children =
-              Enum.map(matching_calls, fn call ->
-                %Block{
-                  id: :erlang.unique_integer([:positive, :monotonic]),
-                  function:
-                    {:cross_process_call, call.target_pid, call.target_name, call.message_form},
-                  absolute_start: call.start_timestamp,
-                  duration: call.end_timestamp - call.start_timestamp,
-                  level: sleep_block.level + 1,
-                  children: []
-                }
-              end)
-
-            %Block{sleep_block | children: call_children}
-          end
-
-        other ->
-          other
-      end)
-
-    %Block{block | children: children}
   end
 
   # Sanitize a GenServer.call message for display in the flamegraph.
@@ -488,6 +657,13 @@ defmodule FlameOn.Client.TraceSession do
             nil
         end
     end
+  end
+
+  defp format_process_name(nil), do: "<process>"
+  defp format_process_name(name) when is_atom(name), do: inspect(name)
+
+  defp format_message_form(form) do
+    inspect(form, charlists: :as_lists)
   end
 
   defp microseconds({mega, secs, micro}),

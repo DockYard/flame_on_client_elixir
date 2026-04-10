@@ -7,6 +7,14 @@ defmodule FlameOn.Client.CollectorTest do
   alias FlameOn.Client.Collector
   alias FlameOn.Client.TraceContext
 
+  setup do
+    # Reset Phase 2 safety mechanisms between tests
+    FlameOn.Client.CircuitBreaker.enable!()
+    :ets.delete_all_objects(:flame_on_trace_dedupe)
+    FlameOn.Client.FinalizationGate.init(2)
+    :ok
+  end
+
   setup :verify_on_exit!
 
   defp start_collector(opts) do

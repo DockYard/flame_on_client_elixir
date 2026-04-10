@@ -11,6 +11,7 @@ defmodule FlameOnClientTest do
       end)
 
       Application.put_env(:flame_on_client, :api_key, "config-api-key")
+      System.delete_env("FLAMEON_API_KEY")
 
       assert FlameOn.Client.config().api_key == "config-api-key"
     end

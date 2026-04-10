@@ -1,4 +1,13 @@
 defmodule FlameOn.Client.Capture.Stack do
+  @moduledoc """
+  DEPRECATED: Stack operations are no longer used by TraceSession (Phase 3).
+
+  TraceSession now maintains a simple list of MFA tuples as call_stack
+  with push (prepend) and pop_stack_to operations, replacing the Block-based
+  stack manipulation. This module is retained for backward compatibility
+  with existing tests but should not be used in new code.
+  """
+
   alias FlameOn.Client.Capture.Block
 
   def finalize_stack([%Block{children: []} = root_block]) do

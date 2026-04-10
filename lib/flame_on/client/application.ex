@@ -4,10 +4,12 @@ defmodule FlameOn.Client.Application do
   @impl true
   def start(_type, _args) do
     maybe_attach_logger_fallback()
+    maybe_init_safety_mechanisms()
 
     children =
       []
       |> maybe_add_grpc_supervisor()
+      |> maybe_add_memory_watcher()
       |> maybe_add_trace_children()
       |> maybe_add_error_children()
 
@@ -18,6 +20,26 @@ defmodule FlameOn.Client.Application do
   def stop(_state) do
     FlameOn.Client.LoggerReporter.detach()
     :ok
+  end
+
+  defp maybe_init_safety_mechanisms do
+    if Application.get_env(:flame_on_client, :capture, false) do
+      FlameOn.Client.CircuitBreaker.init()
+      FlameOn.Client.TraceDedupe.init()
+
+      max_concurrent =
+        Application.get_env(:flame_on_client, :max_concurrent_finalizations, 2)
+
+      FlameOn.Client.FinalizationGate.init(max_concurrent)
+    end
+  end
+
+  defp maybe_add_memory_watcher(children) do
+    if Application.get_env(:flame_on_client, :capture, false) do
+      children ++ [{FlameOn.Client.MemoryWatcher, name: FlameOn.Client.MemoryWatcher}]
+    else
+      children
+    end
   end
 
   defp maybe_add_grpc_supervisor(children) do

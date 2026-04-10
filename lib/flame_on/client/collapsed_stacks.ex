@@ -1,4 +1,14 @@
 defmodule FlameOn.Client.CollapsedStacks do
+  @moduledoc """
+  DEPRECATED: CollapsedStacks conversion is no longer used by TraceSession (Phase 3).
+
+  TraceSession now builds collapsed stacks incrementally during capture in
+  a streaming fashion. The stacks map (%{binary => integer}) IS the collapsed
+  stacks representation, eliminating the need for a post-processing conversion
+  step. This module is retained for backward compatibility with existing tests
+  but should not be used in new code.
+  """
+
   alias FlameOn.Client.Capture.Block
 
   def convert(%Block{} = root) do

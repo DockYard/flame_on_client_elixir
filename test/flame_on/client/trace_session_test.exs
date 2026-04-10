@@ -6,6 +6,13 @@ defmodule FlameOn.Client.TraceSessionTest do
   alias FlameOn.Client.Capture.Trace
   alias FlameOn.Client.TraceSession
 
+  setup do
+    # Reset Phase 2 safety mechanisms between tests
+    FlameOn.Client.CircuitBreaker.enable!()
+    FlameOn.Client.FinalizationGate.init(2)
+    :ok
+  end
+
   setup :verify_on_exit!
 
   defp start_shipper(opts \\ []) do

@@ -3,6 +3,8 @@ defmodule FlameOn.Client.Collector do
 
   require Logger
 
+  alias FlameOn.Client.CircuitBreaker
+  alias FlameOn.Client.TraceDedupe
   alias FlameOn.Client.TraceSessionSupervisor
 
   def start_link(opts) do
@@ -111,6 +113,8 @@ defmodule FlameOn.Client.Collector do
        shipper_pid: config.shipper_pid,
        function_length_threshold: Map.get(config, :function_length_threshold, 0.01),
        max_events: Map.get(config, :max_events, 500_000),
+       max_stacks: Map.get(config, :max_stacks, 50_000),
+       adaptive_degradation: Map.get(config, :adaptive_degradation, true),
        active_traces: %{},
        handler_ids: handler_ids,
        event_thresholds: event_thresholds,
@@ -151,10 +155,19 @@ defmodule FlameOn.Client.Collector do
   end
 
   defp handle_start_event(event, measurements, metadata, caller_pid, trace_id, state) do
+    if CircuitBreaker.disabled?() do
+      {:ok, state}
+    else
+      do_handle_start_event(event, measurements, metadata, caller_pid, trace_id, state)
+    end
+  end
+
+  defp do_handle_start_event(event, measurements, metadata, caller_pid, trace_id, state) do
     case state.handler.handle(event, measurements, metadata) do
       {:capture, info} ->
         if should_sample?(state.sample_rate) and
-             not Map.has_key?(state.active_traces, caller_pid) do
+             not Map.has_key?(state.active_traces, caller_pid) and
+             TraceDedupe.should_trace?(info.event_identifier) do
           threshold_us = Map.get(state.event_thresholds, event, 100_000)
 
           trace_info =
@@ -172,6 +185,8 @@ defmodule FlameOn.Client.Collector do
             shipper_pid: state.shipper_pid,
             function_length_threshold: state.function_length_threshold,
             max_events: state.max_events,
+            max_stacks: state.max_stacks,
+            adaptive_degradation: state.adaptive_degradation,
             seq_trace_label: seq_trace_label,
             seq_trace_router: state.seq_trace_router
           ]
@@ -271,6 +286,8 @@ defmodule FlameOn.Client.Collector do
       function_length_threshold:
         Application.get_env(:flame_on_client, :function_length_threshold, 0.01),
       max_events: Application.get_env(:flame_on_client, :max_events, 500_000),
+      max_stacks: Application.get_env(:flame_on_client, :max_stacks, 50_000),
+      adaptive_degradation: Application.get_env(:flame_on_client, :adaptive_degradation, true),
       shipper_pid: FlameOn.Client.Shipper,
       trace_session_supervisor: FlameOn.Client.TraceSessionSupervisor,
       seq_trace_router: FlameOn.Client.SeqTraceRouter
