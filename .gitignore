@@ -28,3 +28,4 @@ flame_on_client-*.tar
 # MCP server configuration
 .mcp.json
 
+priv/native/
