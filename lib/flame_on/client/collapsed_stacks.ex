@@ -6,32 +6,33 @@ defmodule FlameOn.Client.CollapsedStacks do
     |> List.flatten()
   end
 
-  defp walk(%Block{children: [], function: function, duration: duration}, ancestors) do
-    path = build_path(ancestors ++ [function])
+  defp walk(%Block{children: [], function: function, duration: duration}, ancestors_reversed) do
+    path = build_path_from_reversed([function | ancestors_reversed])
     [%{stack_path: path, duration_us: duration}]
   end
 
-  defp walk(%Block{children: children, function: function, duration: duration}, ancestors) do
-    current_path = ancestors ++ [function]
+  defp walk(%Block{children: children, function: function, duration: duration}, ancestors_reversed) do
+    new_ancestors = [function | ancestors_reversed]
 
     child_entries =
       Enum.flat_map(children, fn child ->
-        walk(child, current_path)
+        walk(child, new_ancestors)
       end)
 
     children_duration = Enum.sum(Enum.map(children, & &1.duration))
     self_time = duration - children_duration
 
     if self_time > 0 do
-      self_entry = %{stack_path: build_path(current_path), duration_us: self_time}
+      self_entry = %{stack_path: build_path_from_reversed(new_ancestors), duration_us: self_time}
       [self_entry | child_entries]
     else
       child_entries
     end
   end
 
-  defp build_path(functions) do
-    functions
+  defp build_path_from_reversed(reversed_list) do
+    reversed_list
+    |> Enum.reverse()
     |> Enum.map(&format_function/1)
     |> Enum.join(";")
   end

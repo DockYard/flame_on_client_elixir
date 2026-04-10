@@ -43,10 +43,9 @@ defmodule FlameOn.Client.ProfileFilter do
   end
 
   defp path_prefixes(path) do
-    parts = String.split(path, ";")
-
-    parts
-    |> Enum.scan(fn part, acc -> acc <> ";" <> part end)
+    positions = :binary.matches(path, ";")
+    prefix_list = Enum.map(positions, fn {pos, _len} -> binary_part(path, 0, pos) end)
+    prefix_list ++ [path]
   end
 
   defp consolidate(samples, small_blocks, inclusive_times) do

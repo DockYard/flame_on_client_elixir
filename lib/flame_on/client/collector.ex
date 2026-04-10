@@ -110,6 +110,7 @@ defmodule FlameOn.Client.Collector do
        sample_rate: config.sample_rate,
        shipper_pid: config.shipper_pid,
        function_length_threshold: Map.get(config, :function_length_threshold, 0.01),
+       max_events: Map.get(config, :max_events, 500_000),
        active_traces: %{},
        handler_ids: handler_ids,
        event_thresholds: event_thresholds,
@@ -170,6 +171,7 @@ defmodule FlameOn.Client.Collector do
             trace_info: trace_info,
             shipper_pid: state.shipper_pid,
             function_length_threshold: state.function_length_threshold,
+            max_events: state.max_events,
             seq_trace_label: seq_trace_label,
             seq_trace_router: state.seq_trace_router
           ]
@@ -268,6 +270,7 @@ defmodule FlameOn.Client.Collector do
       max_buffer_size: Application.get_env(:flame_on_client, :max_buffer_size, 500),
       function_length_threshold:
         Application.get_env(:flame_on_client, :function_length_threshold, 0.01),
+      max_events: Application.get_env(:flame_on_client, :max_events, 500_000),
       shipper_pid: FlameOn.Client.Shipper,
       trace_session_supervisor: FlameOn.Client.TraceSessionSupervisor,
       seq_trace_router: FlameOn.Client.SeqTraceRouter

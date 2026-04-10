@@ -15,12 +15,16 @@ defmodule FlameOn.Client.TraceSession do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  @default_max_events 500_000
+  @finalize_timeout_ms 10_000
+
   @impl true
   def init(opts) do
     traced_pid = Keyword.fetch!(opts, :traced_pid)
     trace_info = Keyword.fetch!(opts, :trace_info)
     shipper_pid = Keyword.fetch!(opts, :shipper_pid)
     function_length_threshold = Keyword.fetch!(opts, :function_length_threshold)
+    max_events = Keyword.get(opts, :max_events, @default_max_events)
     seq_trace_label = Keyword.get(opts, :seq_trace_label)
     seq_trace_router = Keyword.get(opts, :seq_trace_router)
 
@@ -46,6 +50,8 @@ defmodule FlameOn.Client.TraceSession do
            trace_info: trace_info,
            shipper_pid: shipper_pid,
            function_length_threshold: function_length_threshold,
+           max_events: max_events,
+           event_count: 0,
            stack: [root_block],
            seq_trace_label: seq_trace_label,
            seq_trace_router: seq_trace_router,
@@ -61,38 +67,67 @@ defmodule FlameOn.Client.TraceSession do
   # Trace messages — call
   @impl true
   def handle_info({:trace_ts, _pid, :call, mfa, timestamp}, state) do
-    {:noreply,
-     %{state | stack: Stack.handle_trace_call(state.stack, mfa, microseconds(timestamp))}}
+    if state.event_count >= state.max_events do
+      discard_trace(state)
+    else
+      {:noreply,
+       %{
+         state
+         | stack: Stack.handle_trace_call(state.stack, mfa, microseconds(timestamp)),
+           event_count: state.event_count + 1
+       }}
+    end
   end
 
   # Trace messages — return_to
   def handle_info({:trace_ts, _pid, :return_to, mfa, timestamp}, state) do
-    if state.stack != [] and length(state.stack) >= 2 do
-      {:noreply,
-       %{state | stack: Stack.handle_trace_return_to(state.stack, mfa, microseconds(timestamp))}}
+    if state.event_count >= state.max_events do
+      discard_trace(state)
     else
-      {:noreply, state}
+      if state.stack != [] and length(state.stack) >= 2 do
+        {:noreply,
+         %{
+           state
+           | stack: Stack.handle_trace_return_to(state.stack, mfa, microseconds(timestamp)),
+             event_count: state.event_count + 1
+         }}
+      else
+        {:noreply, %{state | event_count: state.event_count + 1}}
+      end
     end
   end
 
   # Trace messages — process scheduled out (sleep)
   def handle_info({:trace_ts, _pid, :out, _mfa, timestamp}, state) do
-    {:noreply,
-     %{state | stack: Stack.handle_trace_call(state.stack, :sleep, microseconds(timestamp))}}
+    if state.event_count >= state.max_events do
+      discard_trace(state)
+    else
+      {:noreply,
+       %{
+         state
+         | stack: Stack.handle_trace_call(state.stack, :sleep, microseconds(timestamp)),
+           event_count: state.event_count + 1
+       }}
+    end
   end
 
   # Trace messages — process scheduled in (wake from sleep)
   def handle_info({:trace_ts, _pid, :in, _mfa, timestamp}, state) do
-    case state.stack do
-      [%Block{function: :sleep} | _] ->
-        {:noreply,
-         %{
-           state
-           | stack: Stack.handle_trace_return_to(state.stack, :sleep, microseconds(timestamp))
-         }}
+    if state.event_count >= state.max_events do
+      discard_trace(state)
+    else
+      case state.stack do
+        [%Block{function: :sleep} | _] ->
+          {:noreply,
+           %{
+             state
+             | stack: Stack.handle_trace_return_to(state.stack, :sleep, microseconds(timestamp)),
+               event_count: state.event_count + 1
+           }}
 
-      _ ->
-        {:noreply, state}
+        _ ->
+          {:noreply, %{state | event_count: state.event_count + 1}}
+      end
     end
   end
 
@@ -193,7 +228,41 @@ defmodule FlameOn.Client.TraceSession do
     {:stop, :normal, state}
   end
 
+  defp discard_trace(state) do
+    Trace.stop_trace(state.traced_pid)
+    trace = state.trace_info
+
+    Logger.warning(
+      "[FlameOn] Trace discarded: exceeded #{state.max_events} events " <>
+        "for #{trace.event_name} #{trace.event_identifier}"
+    )
+
+    {:stop, :normal, state}
+  end
+
   defp finalize_and_ship(state) do
+    task =
+      Task.async(fn ->
+        do_finalize_and_ship(state)
+      end)
+
+    case Task.yield(task, @finalize_timeout_ms) || Task.shutdown(task) do
+      {:ok, _result} ->
+        :ok
+
+      nil ->
+        trace = state.trace_info
+
+        Logger.warning(
+          "[FlameOn] Trace finalization timed out, discarding " <>
+            "for #{trace.event_name} #{trace.event_identifier}"
+        )
+
+        :ok
+    end
+  end
+
+  defp do_finalize_and_ship(state) do
     trace = state.trace_info
 
     if state.stack != [] do
