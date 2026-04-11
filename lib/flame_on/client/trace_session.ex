@@ -41,6 +41,18 @@ defmodule FlameOn.Client.TraceSession do
 
   @impl true
   def init(opts) do
+    # Validate required key early
+    Keyword.fetch!(opts, :traced_pid)
+    use_nif = Keyword.get(opts, :use_nif_tracer, false) and NativeProcessor.tracer_available?()
+
+    if use_nif do
+      init_nif_mode(opts)
+    else
+      init_genserver_mode(opts)
+    end
+  end
+
+  defp init_genserver_mode(opts) do
     traced_pid = Keyword.fetch!(opts, :traced_pid)
     trace_info = Keyword.fetch!(opts, :trace_info)
     shipper_pid = Keyword.fetch!(opts, :shipper_pid)
@@ -71,6 +83,7 @@ defmodule FlameOn.Client.TraceSession do
 
         {:ok,
          %{
+           mode: :genserver,
            traced_pid: traced_pid,
            trace_info: trace_info,
            shipper_pid: shipper_pid,
@@ -101,7 +114,128 @@ defmodule FlameOn.Client.TraceSession do
     end
   end
 
-  # Trace messages -- call
+  defp init_nif_mode(opts) do
+    traced_pid = Keyword.fetch!(opts, :traced_pid)
+    trace_info = Keyword.fetch!(opts, :trace_info)
+    shipper_pid = Keyword.fetch!(opts, :shipper_pid)
+    function_length_threshold = Keyword.fetch!(opts, :function_length_threshold)
+    max_events = Keyword.get(opts, :max_events, @default_max_events)
+    max_stacks = Keyword.get(opts, :max_stacks, @default_max_stacks)
+    adaptive_degradation = Keyword.get(opts, :adaptive_degradation, true)
+    seq_trace_label = Keyword.get(opts, :seq_trace_label)
+    seq_trace_router = Keyword.get(opts, :seq_trace_router)
+
+    buffer_size = Keyword.get(opts, :trace_buffer_size, 4 * 1024 * 1024)
+    drain_interval = Keyword.get(opts, :drain_interval_ms, 1)
+    drain_batch_size = Keyword.get(opts, :drain_batch_size, 10_000)
+
+    case NativeProcessor.create_trace_buffer(buffer_size) do
+      {:ok, buffer} ->
+        NativeProcessor.set_trace_active(buffer, true)
+
+        # Start tracing with the NIF tracer module instead of self()
+        :erlang.trace(traced_pid, true, [
+          :call, :return_to, :running, :arity, :timestamp,
+          {:tracer, FlameOn.Client.NativeProcessor, buffer}
+        ])
+
+        # Apply trace patterns
+        :erlang.trace_pattern({:_, :_, :_}, true, [:local])
+        :erlang.trace_pattern(:on_load, true, [:local])
+
+        if seq_trace_label do
+          SeqTraceRouter.register(seq_trace_label, self())
+        end
+
+        Process.monitor(traced_pid)
+
+        # Schedule periodic drain
+        Process.send_after(self(), :drain, drain_interval)
+
+        now = System.system_time(:microsecond)
+        root_mfa = {:root, trace_info.event_name, trace_info.event_identifier}
+
+        Logger.info("[FlameOn] Using NIF tracer for #{trace_info.event_name} #{trace_info.event_identifier}")
+
+        {:ok,
+         %{
+           mode: :nif,
+           buffer: buffer,
+           traced_pid: traced_pid,
+           trace_info: trace_info,
+           shipper_pid: shipper_pid,
+           function_length_threshold: function_length_threshold,
+           max_events: max_events,
+           max_stacks: max_stacks,
+           adaptive_degradation: adaptive_degradation,
+           drain_interval: drain_interval,
+           drain_batch_size: drain_batch_size,
+           event_count: 0,
+
+           # Streaming collapsed stacks state (same as GenServer mode)
+           call_stack: [root_mfa],
+           stacks: %{},
+           stack_count: 0,
+           current_entry_time: now,
+           trace_start: now,
+           scheduled_out_at: nil,
+
+           # Cross-process tracking
+           seq_trace_label: seq_trace_label,
+           seq_trace_router: seq_trace_router,
+           pending_calls: %{},
+           completed_calls: []
+         }}
+
+      {:error, reason} ->
+        Logger.warning("[FlameOn] Failed to create trace buffer: #{inspect(reason)}, falling back to GenServer mode")
+        init_genserver_mode(opts)
+    end
+  rescue
+    e ->
+      Logger.warning("[FlameOn] NIF tracer init failed: #{inspect(e)}, falling back to GenServer mode")
+      init_genserver_mode(opts)
+  end
+
+  # -- NIF mode: drain timer --
+  @impl true
+  def handle_info(:drain, %{mode: :nif} = state) do
+    case NativeProcessor.drain_trace_buffer(state.buffer, state.drain_batch_size) do
+      {:ok, events} ->
+        state = process_nif_events(events, state)
+        Process.send_after(self(), :drain, state.drain_interval)
+        {:noreply, state}
+
+      {:error, _} ->
+        # NIF error -- schedule next drain and continue
+        Process.send_after(self(), :drain, state.drain_interval)
+        {:noreply, state}
+    end
+  end
+
+  # -- NIF mode: traced process exited --
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, %{mode: :nif} = state) do
+    # Final drain to capture remaining events
+    state =
+      case NativeProcessor.drain_trace_buffer(state.buffer, 1_000_000) do
+        {:ok, events} -> process_nif_events(events, state)
+        {:error, _} -> state
+      end
+
+    NativeProcessor.set_trace_active(state.buffer, false)
+
+    # Handle seq_trace cleanup if needed
+    state = drain_seq_trace_messages(state)
+
+    if state[:seq_trace_label] do
+      SeqTraceRouter.unregister(state.seq_trace_label)
+    end
+
+    finalize_and_ship(state)
+    {:stop, :normal, state}
+  end
+
+  # -- GenServer mode: Trace messages -- call
   @impl true
   def handle_info({:trace_ts, _pid, :call, mfa, timestamp}, state) do
     if state.event_count >= state.max_events do
@@ -295,7 +429,34 @@ defmodule FlameOn.Client.TraceSession do
     {:noreply, state}
   end
 
+  # -- NIF mode: stop --
   @impl true
+  def handle_cast(:stop, %{mode: :nif} = state) do
+    :erlang.trace(state.traced_pid, false, [:all])
+    NativeProcessor.set_trace_active(state.buffer, false)
+
+    # Final drain to capture remaining events
+    state =
+      case NativeProcessor.drain_trace_buffer(state.buffer, 1_000_000) do
+        {:ok, events} -> process_nif_events(events, state)
+        {:error, _} -> state
+      end
+
+    state = drain_seq_trace_messages(state)
+
+    if state[:seq_trace_label] do
+      SeqTraceRouter.unregister(state.seq_trace_label)
+    end
+
+    finalize_and_ship(state)
+    {:stop, :normal, state}
+  rescue
+    ArgumentError ->
+      finalize_and_ship(state)
+      {:stop, :normal, state}
+  end
+
+  # -- GenServer mode: stop --
   def handle_cast(:stop, state) do
     Trace.stop_trace(state.traced_pid)
     state = drain_seq_trace_messages(state)
@@ -401,6 +562,72 @@ defmodule FlameOn.Client.TraceSession do
   end
 
   # -- Private functions --
+
+  # -- NIF event processing --
+  # Converts batches of NIF ring buffer events into the same streaming
+  # collapsed stacks state updates that the GenServer trace_ts handlers perform.
+
+  defp process_nif_events(events, state) when is_list(events) do
+    Enum.reduce(events, state, fn event, acc ->
+      process_nif_event(event, acc)
+    end)
+  end
+
+  defp process_nif_event({:call, mfa, timestamp_us}, state) do
+    %{state |
+      call_stack: [mfa | state.call_stack],
+      current_entry_time: timestamp_us,
+      event_count: state.event_count + 1
+    }
+  end
+
+  defp process_nif_event({:return_to, mfa, timestamp_us}, state) do
+    duration = timestamp_us - state.current_entry_time
+
+    {stacks, stack_count} =
+      if duration > 0 and state.call_stack != [] do
+        path = build_stack_path(state.call_stack)
+        add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, duration)
+      else
+        {state.stacks, state.stack_count}
+      end
+
+    call_stack = pop_stack_to(state.call_stack, mfa)
+
+    %{state |
+      call_stack: call_stack,
+      stacks: stacks,
+      stack_count: stack_count,
+      current_entry_time: timestamp_us,
+      event_count: state.event_count + 1
+    }
+  end
+
+  defp process_nif_event({:out, _mfa, timestamp_us}, state) do
+    %{state | scheduled_out_at: timestamp_us, event_count: state.event_count + 1}
+  end
+
+  defp process_nif_event({:in, _mfa, timestamp_us}, state) do
+    if state.scheduled_out_at do
+      sleep_duration = timestamp_us - state.scheduled_out_at
+      path = build_stack_path([:sleep | state.call_stack])
+
+      {stacks, stack_count} =
+        add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, sleep_duration)
+
+      %{state |
+        stacks: stacks,
+        stack_count: stack_count,
+        scheduled_out_at: nil,
+        event_count: state.event_count + 1
+      }
+    else
+      %{state | event_count: state.event_count + 1}
+    end
+  end
+
+  # Catch-all for unrecognized NIF event types
+  defp process_nif_event(_event, state), do: state
 
   defp maybe_check_mailbox(state) do
     if rem(state.event_count, 1000) == 0 and state.event_count > 0 do

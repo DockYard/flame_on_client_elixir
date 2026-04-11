@@ -196,6 +196,110 @@ defmodule FlameOn.Client.NativeProcessor do
     match?({:ok, _}, process_stacks(%{"test;a" => 1000}, 0.01))
   end
 
+  # -- erl_tracer NIF interface --
+  #
+  # These functions support the Phase 5 erl_tracer NIF integration.
+  # When the NIF is loaded, these stubs are replaced by native implementations
+  # that write trace events to a lock-free ring buffer in native memory,
+  # bypassing the BEAM message queue entirely.
+
+  @doc """
+  Returns true if the erl_tracer NIF callbacks are loaded and functional.
+
+  This checks whether the ring buffer management functions are available,
+  which implies the erl_tracer callbacks (enabled/3, trace/5) are also loaded
+  since they are part of the same shared library.
+  """
+  @spec tracer_available?() :: boolean()
+  def tracer_available? do
+    case create_trace_buffer(1024) do
+      {:ok, _buffer} -> true
+      _ -> false
+    end
+  end
+
+  @doc """
+  erl_tracer behavior callback: called by the VM before generating a trace event.
+
+  When the NIF is loaded, this checks the ring buffer fill level and returns:
+  - `:trace` — generate the event and call trace/5
+  - `:discard` — skip this event but keep tracing (backpressure)
+  - `:remove` — remove all trace flags from this process
+
+  The fallback returns `:remove` to signal that NIF tracing is not available.
+  """
+  def enabled(_trace_tag, _tracer_state, _tracee), do: :remove
+
+  @doc """
+  erl_tracer behavior callback: called by the VM with actual trace event data.
+
+  When the NIF is loaded, this packs the event into a 32-byte struct and writes
+  it to the ring buffer via atomic operations (~200ns per event).
+
+  The fallback is a no-op since `:remove` from enabled/3 prevents this from
+  being called when the NIF is not loaded.
+  """
+  def trace(_trace_tag, _tracer_state, _tracee, _trace_term, _opts), do: :ok
+
+  @doc """
+  Allocate a ring buffer for trace events in native memory.
+
+  Returns `{:ok, buffer_ref}` where `buffer_ref` is an opaque NIF resource
+  reference, or `{:error, reason}`.
+
+  ## Arguments
+
+    * `size_bytes` - Size of the ring buffer in bytes. 4MB (~125K events) is
+      the recommended default.
+  """
+  @spec create_trace_buffer(pos_integer()) :: {:ok, reference()} | {:error, atom()}
+  def create_trace_buffer(_size_bytes), do: {:error, :nif_not_loaded}
+
+  @doc """
+  Read up to `max_count` events from the ring buffer.
+
+  Advances the read pointer. Returns `{:ok, events}` where events is a list
+  of tuples. The exact tuple format depends on the event type:
+
+    * `{:call, {module, function, arity}, timestamp_us}`
+    * `{:return_to, {module, function, arity}, timestamp_us}`
+    * `{:out, {module, function, arity}, timestamp_us}`
+    * `{:in, {module, function, arity}, timestamp_us}`
+
+  ## Arguments
+
+    * `buffer` - Ring buffer reference from `create_trace_buffer/1`
+    * `max_count` - Maximum number of events to drain in this batch
+  """
+  @spec drain_trace_buffer(reference(), pos_integer()) :: {:ok, list()} | {:error, atom()}
+  def drain_trace_buffer(_buffer, _max_count), do: {:error, :nif_not_loaded}
+
+  @doc """
+  Returns statistics about the ring buffer.
+
+  Returns `{write_pos, read_pos, capacity, overflow_count}` for monitoring.
+
+  ## Arguments
+
+    * `buffer` - Ring buffer reference from `create_trace_buffer/1`
+  """
+  @spec trace_buffer_stats(reference()) :: tuple() | {:error, atom()}
+  def trace_buffer_stats(_buffer), do: {:error, :nif_not_loaded}
+
+  @doc """
+  Set the active flag on a ring buffer.
+
+  When active is `false`, the `enabled/3` callback returns `:remove`, telling
+  the VM to remove all trace flags from the traced process.
+
+  ## Arguments
+
+    * `buffer` - Ring buffer reference from `create_trace_buffer/1`
+    * `active` - Boolean flag
+  """
+  @spec set_trace_active(reference(), boolean()) :: :ok | {:error, atom()}
+  def set_trace_active(_buffer, _active), do: {:error, :nif_not_loaded}
+
   @doc """
   Process collapsed stacks into a pprof Profile protobuf binary.
 

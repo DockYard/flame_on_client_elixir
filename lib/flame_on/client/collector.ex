@@ -119,7 +119,11 @@ defmodule FlameOn.Client.Collector do
        handler_ids: handler_ids,
        event_thresholds: event_thresholds,
        trace_session_supervisor: config.trace_session_supervisor,
-       seq_trace_router: config.seq_trace_router
+       seq_trace_router: config.seq_trace_router,
+       # NIF tracer config
+       trace_buffer_size: Map.get(config, :trace_buffer_size, 4 * 1024 * 1024),
+       drain_interval_ms: Map.get(config, :drain_interval_ms, 1),
+       drain_batch_size: Map.get(config, :drain_batch_size, 10_000)
      }}
   end
 
@@ -188,7 +192,12 @@ defmodule FlameOn.Client.Collector do
             max_stacks: state.max_stacks,
             adaptive_degradation: state.adaptive_degradation,
             seq_trace_label: seq_trace_label,
-            seq_trace_router: state.seq_trace_router
+            seq_trace_router: state.seq_trace_router,
+            # NIF tracer config — TraceSession checks availability and falls back
+            use_nif_tracer: true,
+            trace_buffer_size: state.trace_buffer_size,
+            drain_interval_ms: state.drain_interval_ms,
+            drain_batch_size: state.drain_batch_size
           ]
 
           case TraceSessionSupervisor.start_session(
@@ -290,7 +299,12 @@ defmodule FlameOn.Client.Collector do
       adaptive_degradation: Application.get_env(:flame_on_client, :adaptive_degradation, true),
       shipper_pid: FlameOn.Client.Shipper,
       trace_session_supervisor: FlameOn.Client.TraceSessionSupervisor,
-      seq_trace_router: FlameOn.Client.SeqTraceRouter
+      seq_trace_router: FlameOn.Client.SeqTraceRouter,
+      # NIF tracer config
+      trace_buffer_size:
+        Application.get_env(:flame_on_client, :trace_buffer_size, 4 * 1024 * 1024),
+      drain_interval_ms: Application.get_env(:flame_on_client, :drain_interval_ms, 1),
+      drain_batch_size: Application.get_env(:flame_on_client, :drain_batch_size, 10_000)
     }
 
     Map.merge(defaults, Map.new(opts))
