@@ -744,3 +744,318 @@ The Phase 3 architecture is designed to make this straightforward:
 - If the NIF crashes, only the current trace is lost — the BEAM process is unaffected (dirty NIF scheduler)
 
 This document will be extended when Phase 4 implementation begins.
+
+---
+
+## Phase 5: erl_tracer NIF with Ring Buffer
+
+### 5.1 Problem Statement
+
+FlameOn starts `erlang:trace` at the telemetry `:start` event and traces EVERY function call for the entire request duration. The 200ms threshold is only checked AFTER the trace ends, in `do_finalize_and_ship`. This means:
+
+- **Every sampled request** (10% by default) pays full tracing cost
+- **95%+ of traced requests** finish fast, and all trace data is discarded
+- **The GenServer mailbox is unbounded** — `erlang:trace` sends messages faster than the TraceSession GenServer can process them
+- **Production impact**: 70K+ message queues, 130MB+ binary references, repeated overflow warnings
+
+The Phase 3 streaming architecture improved post-processing memory (O(P) stacks map instead of O(N) Block tree), but the fundamental problem remains: every trace event creates a BEAM message that lands in the TraceSession mailbox. The `{:tracer, self()}` option in `Trace.start_trace/2` means the traced process sends a message per event, and each message allocates on the BEAM heap, copies data, and enters an unbounded queue. The mailbox depth check (Phase 2.4) and adaptive degradation (Phase 3.6) are reactive — damage is already done by the time they fire.
+
+### 5.2 Solution Overview
+
+Replace the process-based tracer (`{:tracer, self()}`) with a Zig NIF implementing the `erl_tracer` behavior. The OTP `erl_tracer` module interface (introduced in OTP 19) allows a NIF module to receive trace events directly — bypassing the BEAM message queue entirely.
+
+Key changes:
+
+1. **Trace events write to a fixed-size ring buffer** (4MB default, configurable) in native memory via NIF callback — zero BEAM heap allocation per trace event
+2. **Structural backpressure**: the `enabled/3` callback returns `:discard` when the buffer is >90% full, telling the VM to skip events before they are generated
+3. **A drain timer** in TraceSession reads the buffer periodically and builds streaming collapsed stacks (reusing the Phase 3 `build_stack_path` + `add_to_stacks` pipeline)
+4. **Full request tracing from the start** — no data loss for slow request root causes
+5. **Total memory bounded by config**: `buffer_size x max_concurrent_traces`
+
+### 5.3 Architecture
+
+#### Ring Buffer (in Zig)
+
+SPSC (single-producer, single-consumer) lock-free design using atomic read/write pointers. One buffer is allocated per traced process.
+
+- **Fixed allocation**: 4MB default = ~125K events at 32 bytes each
+- **Overflow policy**: overwrite oldest entries (the write pointer advances past the read pointer)
+- **Entry format**: 32-byte packed struct
+
+```
+TraceEntry (32 bytes):
+  event_type   : u8     — call, return_to, out, in
+  arity        : u8     — function arity (0-255)
+  _pad         : [6]u8  — alignment padding
+  module_atom  : u64    — raw ERL_NIF_TERM value for module atom
+  function_atom: u64    — raw ERL_NIF_TERM value for function atom
+  timestamp_us : u64    — microsecond timestamp
+```
+
+Raw `ERL_NIF_TERM` values are stored for atoms because atoms are never garbage-collected in the BEAM — once created, an atom's term value is stable for the lifetime of the VM. This avoids the cost of converting atoms to strings in the hot path and defers string conversion to the drain phase.
+
+**Sequence tracking**: The write pointer itself serves as the sequence number. No separate field is needed — the buffer position uniquely identifies each entry's order.
+
+#### erl_tracer Callbacks (in Zig, as NIFs)
+
+The OTP `erl_tracer` behavior requires two callbacks that the VM calls directly as NIFs. These are not Elixir functions — they are C-ABI NIF functions registered under the tracer module's name.
+
+**`enabled/3` (~10ns)**:
+
+Called by the VM before generating a trace event. This is the backpressure point.
+
+```
+enabled(TraceTag, TracerState, Tracee) -> trace | discard | remove
+
+Implementation:
+  1. Extract buffer resource from TracerState
+  2. Check atomic "active" flag — if not active, return `remove`
+     (tells VM to remove all trace flags from this process)
+  3. Check buffer fill level — if >90% full, return `discard`
+     (tells VM to skip this event but keep tracing)
+  4. Otherwise return `trace`
+     (tells VM to generate the event and call trace/5)
+```
+
+**`trace/5` (~200ns)**:
+
+Called by the VM with the actual trace event data. This is the capture point.
+
+```
+trace(TraceTag, TracerState, Tracee, TraceTerm, Opts) -> ignored
+
+Implementation:
+  1. Extract event_type from TraceTag atom (:call, :return_to, :out, :in)
+  2. Extract module, function, arity from TraceTerm
+     (for :call/:return_to, TraceTerm is {Module, Function, Arity})
+  3. Extract timestamp from Opts (the :timestamp option)
+  4. Pack into 32-byte TraceEntry struct
+  5. Atomic write to ring buffer:
+     - Load current write_pos (atomic relaxed)
+     - memcpy entry into buffer[write_pos % capacity]
+     - Store write_pos + 1 (atomic release)
+  6. Return (return value is ignored by the VM)
+```
+
+**`enabled/6`**: The 6-arity version is called for events that have extra data (e.g., `:send` and `:receive` with message content). Since FlameOn only traces `:call`, `:return_to`, and `:running`, this callback can simply delegate to `enabled/3`.
+
+**`trace/6`**: Similarly, the 6-arity trace callback handles events with extra info. Delegate to `trace/5` or return immediately for unhandled event types.
+
+#### Additional NIF Functions
+
+These are regular NIF functions called from Elixir (not erl_tracer callbacks):
+
+| Function | Purpose |
+|----------|---------|
+| `create_buffer(size_bytes)` | Allocate ring buffer as a NIF resource. Returns opaque reference. |
+| `drain_buffer(buffer, max_count)` | Read up to N entries from the buffer. Advances the read pointer. Returns an Elixir list of `{event_type, module, function, arity, timestamp_us}` tuples. Atom terms are converted back to Elixir atoms here. |
+| `buffer_stats(buffer)` | Returns `{write_pos, read_pos, capacity, overflow_count}` for monitoring. |
+| `set_active(buffer, boolean)` | Set the atomic active flag. When false, `enabled/3` returns `:remove`. |
+| `destroy_buffer(buffer)` | Explicit deallocation. Also happens automatically via NIF resource destructor when the Elixir reference is GC'd. |
+
+#### TraceSession Changes
+
+The TraceSession GenServer is modified to use the NIF tracer when available, falling back to the current message-based approach when the NIF is not loaded.
+
+**`init/1` — NIF path**:
+
+```elixir
+case FlameOn.Client.TracerModule.available?() do
+  true ->
+    # Create ring buffer in native memory
+    {:ok, buffer} = TracerModule.create_buffer(config.trace_buffer_size)
+
+    # Start trace with NIF tracer module instead of self()
+    :erlang.trace(traced_pid, true, [
+      :call, :return_to, :running, :arity, :timestamp,
+      {:tracer, FlameOn.Client.TracerModule, buffer}
+    ])
+    :erlang.trace_pattern({:_, :_, :_}, true, [:local])
+    :erlang.trace_pattern(:on_load, true, [:local])
+
+    # Start periodic drain timer
+    Process.send_after(self(), :drain, config.drain_interval_ms)
+
+    {:ok, %{state | buffer: buffer, tracer_mode: :nif}}
+
+  false ->
+    # Fall back to current GenServer-based approach
+    Trace.start_trace(traced_pid, self())
+    {:ok, %{state | tracer_mode: :genserver}}
+end
+```
+
+**Remove ALL `handle_info({:trace_ts, ...})` handlers** — when in NIF mode, no trace messages arrive in the mailbox. The existing handlers remain for the GenServer fallback path.
+
+**Add `handle_info(:drain, state)`** — periodic drain:
+
+```elixir
+def handle_info(:drain, %{tracer_mode: :nif} = state) do
+  # Read a batch of events from the ring buffer
+  events = TracerModule.drain_buffer(state.buffer, state.drain_batch_size)
+
+  # Process through the same streaming collapsed stacks pipeline
+  state = Enum.reduce(events, state, &process_nif_event/2)
+
+  # Schedule next drain
+  Process.send_after(self(), :drain, state.drain_interval_ms)
+  {:noreply, state}
+end
+```
+
+**`process_nif_event/2`** — converts NIF event tuples into the same state updates that the current `handle_info` clauses perform:
+
+```elixir
+defp process_nif_event({:call, module, function, arity, timestamp_us}, state) do
+  mfa = {module, function, arity}
+  %{state |
+    call_stack: [mfa | state.call_stack],
+    current_entry_time: timestamp_us,
+    event_count: state.event_count + 1
+  }
+end
+
+defp process_nif_event({:return_to, module, function, arity, timestamp_us}, state) do
+  mfa = {module, function, arity}
+  duration = timestamp_us - state.current_entry_time
+
+  {stacks, stack_count} =
+    if duration > 0 and state.call_stack != [] do
+      path = build_stack_path(state.call_stack)
+      add_to_stacks(state.stacks, state.stack_count, state.max_stacks, path, duration)
+    else
+      {state.stacks, state.stack_count}
+    end
+
+  call_stack = pop_stack_to(state.call_stack, mfa)
+
+  %{state |
+    call_stack: call_stack,
+    stacks: stacks,
+    stack_count: stack_count,
+    current_entry_time: timestamp_us,
+    event_count: state.event_count + 1
+  }
+end
+
+# :out and :in handled similarly, updating scheduled_out_at / sleep stacks
+```
+
+**On trace end (`:DOWN` or `:stop`)**: perform a final drain to capture any remaining events in the buffer, then `finalize_and_ship` as before. The stacks map is already in collapsed format — no change to the shipping path.
+
+#### Collector Changes
+
+Minimal changes to the Collector:
+
+- Pass `trace_buffer_size`, `drain_interval_ms`, and `drain_batch_size` through to TraceSession opts
+- No change to when traces start — still at telemetry `:start` event after sampling
+- The threshold check remains in `do_finalize_and_ship` (ship only if duration >= threshold)
+- The cost of tracing a fast request is now ~N x 200ns of NIF writes + 4MB buffer allocation, not ~N x 2-5us of message sends + unbounded mailbox growth
+
+#### Fallback Behavior
+
+When the NIF is unavailable (compilation failure, unsupported platform, load error), the system falls back to the current GenServer-based approach with all Phase 1-3 protections active:
+
+- TraceSession uses `{:tracer, self()}` and processes `{:trace_ts, ...}` messages
+- Mailbox depth checks, adaptive degradation, max_events limits all apply
+- The `tracer_mode` field in state controls which code path is active
+- A single `Logger.info` at startup indicates which mode is in use
+
+### 5.4 File Changes
+
+#### In `flame_on_processor` (Zig NIF repository)
+
+| File | Change |
+|------|--------|
+| `src/ring_buffer.zig` | **New** — standalone ring buffer data structure with SPSC atomics |
+| `src/tracer_nif.zig` | **New** — erl_tracer callback implementations + NIF resource management |
+| `build.zig` | **Modified** — include tracer NIF exports in the same shared library alongside the existing processor NIF |
+| `.github/workflows/release.yml` | **Modified** — rebuild with tracer NIF; same artifact, same release |
+
+The tracer NIF and processor NIF share a single `.so`/`.dylib` file. This avoids loading two separate shared libraries and simplifies distribution. The `build.zig` already builds `libflame_on_processor_nif`; it gains additional exported symbols for the tracer callbacks.
+
+#### In `flame_on_client_elixir` (this repository)
+
+| File | Change |
+|------|--------|
+| `lib/flame_on/client/tracer_module.ex` | **New** — Elixir module that loads the NIF and exposes `create_buffer/1`, `drain_buffer/2`, `buffer_stats/1`, `set_active/2`, `destroy_buffer/1`, and `available?/0`. Follows the same `@on_load` + `ensure_precompiled` pattern as `NativeProcessor`. |
+| `lib/flame_on/client/trace_session.ex` | **Modified** — add `tracer_mode` to state, NIF init path, `:drain` handler, `process_nif_event/2`, final drain on stop. Existing `handle_info({:trace_ts, ...})` clauses retained for GenServer fallback. |
+| `lib/flame_on/client/collector.ex` | **Modified** — pass NIF-related config through to TraceSession opts |
+| `lib/flame_on/client/capture/trace.ex` | **Modified** — add `start_trace/3` clause that accepts `{:tracer, module, state}` tuple for NIF mode |
+
+### 5.5 Configuration
+
+```elixir
+config :flame_on_client,
+  # Ring buffer size per trace (bytes). Determines max events before overwrite.
+  # 4MB = ~125K events at 32 bytes each.
+  trace_buffer_size: 4 * 1024 * 1024,
+
+  # How often the drain timer fires (milliseconds).
+  # Lower = more responsive stacks map updates, higher = less overhead.
+  drain_interval_ms: 1,
+
+  # Max events read per drain cycle.
+  # Bounds the time spent in a single drain to avoid blocking the GenServer.
+  drain_batch_size: 10_000,
+
+  # Buffer fill fraction at which enabled/3 returns :discard.
+  # Events are skipped (not lost — the trace continues) until the drain
+  # catches up and frees space.
+  backpressure_threshold: 0.9
+```
+
+### 5.6 Memory Budget
+
+Per trace: one ring buffer of `trace_buffer_size` bytes (4MB default), allocated in native memory (outside BEAM heap). The buffer is freed when the TraceSession terminates (via NIF resource destructor).
+
+Max concurrent traces is controlled by `sample_rate` + `CircuitBreaker` + `MemoryWatcher` (Phase 2). The ring buffers add a predictable, bounded cost:
+
+| Scenario | Active Traces | Buffer Memory |
+|----------|--------------|---------------|
+| 1% sample rate, 100 concurrent requests | ~1 | 4MB |
+| 10% sample rate, 100 concurrent requests | ~10 | 40MB |
+| 10% sample rate, 1000 concurrent requests | ~100 | 400MB |
+| 100% sample rate, 1000 concurrent requests | ~1000 | 4GB |
+
+The last scenario is pathological and would be caught by `MemoryWatcher` tripping the `CircuitBreaker` well before reaching 1000 active traces. In practice, 10-50 concurrent traces is the upper bound for production use.
+
+### 5.7 Performance Comparison
+
+| Metric | Current (GenServer) | NIF Tracer |
+|--------|-------------------|------------|
+| Per-event capture cost | ~2-5us (message copy to mailbox) | ~200ns (NIF write to ring buffer) |
+| Max throughput | ~200K events/sec | ~2-5M events/sec |
+| Traced process heap impact | Message allocation per event | Zero |
+| Backpressure | Reactive (mailbox check every 1K events) | Proactive (`enabled/3` called by VM every event) |
+| Overflow behavior | 70K+ queued messages, 130MB+ | Fixed buffer, oldest overwritten |
+| Memory bound | Unbounded (mailbox grows with event count) | Fixed (4MB default, configurable) |
+| Fast request cost (discarded trace) | 50K messages created + GC'd | 50K x 200ns NIF writes = 10ms + 4MB freed |
+| TraceSession mailbox depth | Grows with event rate | Zero trace messages (only `:drain` timer) |
+
+### 5.8 Implementation Order
+
+1. **`ring_buffer.zig`** — standalone data structure with comprehensive tests: SPSC correctness, overflow/wrap-around, atomic ordering, concurrent read/write
+2. **`tracer_nif.zig`** — erl_tracer callbacks using ring_buffer, NIF resource type for buffer lifecycle, `create_buffer`/`drain_buffer`/`buffer_stats`/`set_active`/`destroy_buffer` exports
+3. **Update `build.zig`** — include tracer exports in the shared library, ensure both processor and tracer symbols are exported
+4. **`tracer_module.ex`** — Elixir NIF wrapper following the `NativeProcessor` pattern (`@on_load`, `ensure_precompiled`, fallback stubs)
+5. **Modify `trace_session.ex`** — add NIF init path, drain-based processing, `tracer_mode` branching, final drain on stop
+6. **Modify `collector.ex`** — pass NIF config through to TraceSession
+7. **Modify `capture/trace.ex`** — add NIF-aware `start_trace/3`
+8. **Tests** — ring buffer overflow, backpressure (`enabled/3` returns `:discard`), drain correctness, NIF-to-stacks-map pipeline, GenServer fallback, concurrent traces with independent buffers
+9. **Update GitHub Action** — rebuild release artifact with tracer NIF symbols
+10. **Tag release** — new version of `flame_on_processor`
+
+### 5.9 Risks and Mitigations
+
+1. **NIF bugs crash the VM.** Zig's safety features (bounds checking, null safety, no undefined behavior in safe mode) reduce this risk significantly. The ring buffer is a simple data structure with a small API surface. Extensive testing at the Zig level (step 1) catches issues before BEAM integration. The `destroy_buffer` NIF resource destructor ensures cleanup even on abnormal TraceSession termination.
+
+2. **Atom term storage.** Raw `ERL_NIF_TERM` values for atoms are stable for VM lifetime since atoms are never GC'd, but this is not formally guaranteed across hot code upgrades. In practice, atom term values do not change during hot upgrades — only module code is swapped. This is an acceptable risk for a profiling tool. If a hot upgrade does invalidate atom terms, the worst case is garbled function names in one flame graph, not a crash.
+
+3. **SPSC assumption.** One buffer per traced process. The VM calls `trace/5` from the scheduler thread running the traced process (single producer). The TraceSession GenServer drains the buffer (single consumer). Multiple concurrent traces each get their own buffer — no sharing, no contention.
+
+4. **OTP compatibility.** The `erl_tracer` behavior was introduced in OTP 19 (2016). All supported OTP versions (25+) include it. The `:tracer` option in `erlang:trace/3` accepts `{Module, State}` where `Module` implements the behavior as NIFs.
+
+5. **Drain latency.** With a 1ms drain interval and 10K batch size, there is up to 1ms of latency between an event occurring and it being processed into the stacks map. This is irrelevant for profiling — flame graphs are post-hoc analysis, not real-time. If the traced process generates events faster than the drain can process them, the ring buffer absorbs the burst (up to 125K events at default size), and `enabled/3` applies backpressure beyond that.
+
+6. **Cross-process tracing.** The `seq_trace` mechanism for cross-process GenServer.call tracking still uses BEAM messages (routed through `SeqTraceRouter`). These are low-volume (one message per cross-process call, not per function call) and remain unchanged. Only the high-volume `:call`/`:return_to`/`:running` events move to the NIF path.
